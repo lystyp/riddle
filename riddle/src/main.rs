@@ -2,13 +2,20 @@
 //!
 //! Write on the page with the pen. After a pause the diary drinks your ink,
 //! and an answer writes itself onto the page in a flowing hand, then fades.
+//!
+//! Two display backends (picked at runtime): windowed via qtfb/AppLoad when
+//! QTFB_KEY is set, or full takeover via the vendor engine (quill) when
+//! built with --features takeover and launched with xochitl stopped.
 
+mod display;
 mod fb;
 mod ink;
 mod oracle;
 mod pen;
 mod qtfb;
 mod script;
+mod surface;
+mod touch;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -18,6 +25,7 @@ use std::time::{Duration, Instant};
 use ab_glyph::FontRef;
 
 use fb::{BBox, SCREEN_H, SCREEN_W};
+use surface::{Surface, BLACK, WHITE};
 
 const FONT_TTF: &[u8] = include_bytes!("../fonts/DancingScript.ttf");
 const PNG_PATH: &str = "/tmp/riddle-page.png";
@@ -27,22 +35,15 @@ const REPLY_PX: f32 = 96.0;
 const MARGIN_X: i32 = 120;
 
 enum State {
-    /// Blank page; pen writes ink. Instant holds the last pen activity.
     Listening { last_pen: Option<Instant> },
-    /// Ink dissolve animation, then send to the oracle.
     Drinking { stage: u32, next: Instant, region: BBox },
-    /// Waiting for the oracle; pulse a small blot.
     Thinking { rx: mpsc::Receiver<Result<String, String>>, pulse: Instant, blot_on: bool },
-    /// Writing the reply stroke by stroke.
     Replying { plan: WritePlan, next: Instant },
-    /// Reply on page; wait, then dissolve it.
     Lingering { until: Instant, region: BBox },
     FadingReply { stage: u32, next: Instant, region: BBox },
 }
 
-/// Precomputed reply strokes in screen coordinates.
 struct WritePlan {
-    /// Each stroke is a polyline of screen points.
     strokes: Vec<Vec<(i32, i32)>>,
     stroke_i: usize,
     point_i: usize,
@@ -57,23 +58,18 @@ fn main() {
 }
 
 fn run() -> std::io::Result<()> {
-    let key: i32 = std::env::var("QTFB_KEY")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or_else(|| {
-            eprintln!("riddle: QTFB_KEY not set (launch via AppLoad)");
-            std::process::exit(2);
-        });
-
     let font = FontRef::try_from_slice(FONT_TTF).map_err(std::io::Error::other)?;
 
-    let mut client = qtfb::QtfbClient::connect(key, qtfb::FBFMT_RMPP_RGB565, SCREEN_W, SCREEN_H, 2)?;
-    // UFAST waveform: the lowest-latency e-ink path, made for live ink
-    // (1s server-side stall on this call, once at startup).
-    let _ = client.set_refresh_mode(qtfb::REFRESH_MODE_UFAST);
+    let (disp, mut surf) = display::Display::open()?;
+    let takeover = matches!(disp, display::Display::Quill);
+    eprintln!(
+        "riddle: display {} ({}x{} stride {})",
+        if takeover { "quill/takeover" } else { "qtfb" },
+        surf.w,
+        surf.h,
+        surf.stride
+    );
 
-    // Raw digitizer: full pressure/tilt/eraser at hardware rate. Grabbed so
-    // xochitl ignores the pen while the diary is open.
     let mut pen_dev = match pen::PenDevice::open() {
         Ok(p) => Some(p),
         Err(e) => {
@@ -81,30 +77,36 @@ fn run() -> std::io::Result<()> {
             None
         }
     };
+    // Takeover mode: touch is ours too; 5-finger tap = quit.
+    let mut touch_dev = if takeover { touch::TouchDevice::open().ok() } else { None };
 
     let sigterm = Arc::new(AtomicBool::new(false));
     signal_hook::flag::register(signal_hook::consts::SIGTERM, Arc::clone(&sigterm))?;
     signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&sigterm))?;
 
     // Blank page.
-    fb::fill_rect(client.framebuffer(), 0, 0, SCREEN_W, SCREEN_H, fb::WHITE);
-    client.update_all()?;
+    surf.fill_rect(0, 0, SCREEN_W, SCREEN_H, WHITE);
+    disp.update_all(surf.w, surf.h);
 
     let mut user_ink = ink::Ink::new();
     let mut state = State::Listening { last_pen: None };
     let mut pen_down = false;
-    // Ink updates are coalesced: draw into the framebuffer immediately, but
-    // flush at most one partial update per interval so the Qt queue never
-    // backs up behind us.
     let mut ink_dirty = BBox::empty();
     let mut last_flush = Instant::now();
-    const FLUSH_EVERY: Duration = Duration::from_millis(35);
+    // Takeover swaps are cheap and synchronous; qtfb needs coalescing.
+    let flush_every = if takeover { Duration::from_millis(8) } else { Duration::from_millis(35) };
 
-    eprintln!("riddle: the diary is open (key {key})");
+    eprintln!("riddle: the diary is open");
 
     loop {
         if sigterm.load(Ordering::Relaxed) {
             break;
+        }
+        if let Some(ref mut t) = touch_dev {
+            if t.drain_check_quit() {
+                eprintln!("riddle: 5-finger quit");
+                break;
+            }
         }
 
         // ---- raw pen (preferred path) ----
@@ -124,14 +126,12 @@ fn run() -> std::io::Result<()> {
                 match state {
                     State::Listening { ref mut last_pen } => {
                         pen_down = true;
-                        let fbuf = client.framebuffer();
                         let d = match s.tool {
                             pen::Tool::Pen => {
-                                // Quill: 2..5px with real 0..4096 pressure.
                                 let r = 2 + s.pressure * 3 / pen::MAX_PRESSURE;
-                                user_ink.pen_point(fbuf, s.x, s.y, r)
+                                user_ink.pen_point(&mut surf, s.x, s.y, r)
                             }
-                            pen::Tool::Eraser => user_ink.erase_point(fbuf, s.x, s.y, 22),
+                            pen::Tool::Eraser => user_ink.erase_point(&mut surf, s.x, s.y, 22),
                         };
                         if !d.is_empty() {
                             ink_dirty.add(d.x0, d.y0, 0);
@@ -147,22 +147,21 @@ fn run() -> std::io::Result<()> {
             }
         }
 
-        // ---- qtfb events: touch/close, plus pen fallback ----
-        let events = match client.drain_events() {
+        // ---- window-system events (qtfb close detection + pen fallback) ----
+        let events = match disp.pump() {
             Ok(v) => v,
-            Err(_) => break, // window closed
+            Err(_) => break, // qtfb window closed
         };
         for ev in events {
             if pen_dev.is_some() {
-                continue; // raw path owns the pen; nothing else used
+                continue;
             }
             match ev.input_type {
                 qtfb::INPUT_PEN_PRESS | qtfb::INPUT_PEN_UPDATE => {
                     if let State::Listening { ref mut last_pen } = state {
                         pen_down = true;
-                        let fbuf = client.framebuffer();
                         let r = 2 + ev.d.clamp(0, 100) / 45;
-                        let d = user_ink.pen_point(fbuf, ev.x, ev.y, r);
+                        let d = user_ink.pen_point(&mut surf, ev.x, ev.y, r);
                         if !d.is_empty() {
                             ink_dirty.add(d.x0, d.y0, 0);
                             ink_dirty.add(d.x1, d.y1, 0);
@@ -181,103 +180,85 @@ fn run() -> std::io::Result<()> {
                         }
                     }
                 }
-                _ => {} // touch ignored: the diary knows a hand from a quill
+                _ => {}
             }
         }
 
         // ---- coalesced ink flush ----
-        if !ink_dirty.is_empty() && last_flush.elapsed() >= FLUSH_EVERY {
+        if !ink_dirty.is_empty() && last_flush.elapsed() >= flush_every {
             let (x, y, w, h) = ink_dirty.rect();
-            let _ = client.update_partial(x, y, w, h);
+            disp.update(x, y, w, h, true);
             ink_dirty = BBox::empty();
             last_flush = Instant::now();
         }
 
         // ---- state machine ----
         state = match state {
-            State::Listening { last_pen } => {
-                match last_pen {
-                    Some(t)
-                        if !pen_down
-                            && t.elapsed() >= IDLE_COMMIT
-                            && !user_ink.is_empty() =>
-                    {
-                        // Snapshot the page for the oracle BEFORE dissolving.
-                        if let Err(e) = user_ink.to_png(client.framebuffer(), PNG_PATH) {
-                            eprintln!("riddle: rasterize failed: {e}");
-                        }
-                        let region = user_ink.bbox;
-                        State::Drinking { stage: 0, next: Instant::now(), region }
+            State::Listening { last_pen } => match last_pen {
+                Some(t) if !pen_down && t.elapsed() >= IDLE_COMMIT && !user_ink.is_empty() => {
+                    if let Err(e) = user_ink.to_png(&surf, PNG_PATH) {
+                        eprintln!("riddle: rasterize failed: {e}");
                     }
-                    _ => State::Listening { last_pen },
+                    let region = user_ink.bbox;
+                    State::Drinking { stage: 0, next: Instant::now(), region }
                 }
-            }
+                _ => State::Listening { last_pen },
+            },
 
             State::Drinking { stage, next, region } => {
-                const STAGES: u32 = 7;
+                const STAGES: u32 = 14;
                 if Instant::now() >= next {
-                    let fbuf = client.framebuffer();
-                    ink::dissolve_pass(fbuf, region, stage, STAGES);
+                    ink::dissolve_pass(&mut surf, region, stage, STAGES);
                     let (x, y, w, h) = region.rect();
-                    let _ = client.update_partial(x, y, w, h);
+                    disp.update(x, y, w, h, true);
                     if stage + 1 >= STAGES {
                         user_ink.clear();
                         let (tx, rx) = mpsc::channel();
                         oracle::ask(PNG_PATH.to_string(), tx);
                         State::Thinking { rx, pulse: Instant::now(), blot_on: false }
                     } else {
-                        State::Drinking { stage: stage + 1, next: Instant::now() + Duration::from_millis(160), region }
+                        State::Drinking { stage: stage + 1, next: Instant::now() + Duration::from_millis(70), region }
                     }
                 } else {
                     State::Drinking { stage, next, region }
                 }
             }
 
-            State::Thinking { rx, pulse, blot_on } => {
-                match rx.try_recv() {
-                    Ok(result) => {
-                        // Clear the blot.
-                        let fbuf = client.framebuffer();
-                        fb::fill_rect(fbuf, SCREEN_W / 2 - 14, SCREEN_H / 2 - 14, 28, 28, fb::WHITE);
-                        let _ = client.update_partial(SCREEN_W as i32 / 2 - 14, SCREEN_H as i32 / 2 - 14, 28, 28);
-                        let text = match result {
-                            Ok(t) => t,
-                            Err(e) => {
-                                eprintln!("riddle: oracle failed: {e}");
-                                "…".to_string()
-                            }
-                        };
-                        let plan = plan_reply(&font, &text);
-                        State::Replying { plan, next: Instant::now() }
-                    }
-                    Err(mpsc::TryRecvError::Empty) => {
-                        // Pulse a small ink blot mid-page: the diary breathing.
-                        if pulse.elapsed() >= Duration::from_millis(600) {
-                            let fbuf = client.framebuffer();
-                            let (cx, cy) = (SCREEN_W as i32 / 2, SCREEN_H as i32 / 2);
-                            if blot_on {
-                                fb::fill_rect(fbuf, cx as usize - 14, cy as usize - 14, 28, 28, fb::WHITE);
-                            } else {
-                                fb::stamp(fbuf, cx, cy, 9, fb::BLACK);
-                            }
-                            let _ = client.update_partial(cx - 14, cy - 14, 28, 28);
-                            State::Thinking { rx, pulse: Instant::now(), blot_on: !blot_on }
-                        } else {
-                            State::Thinking { rx, pulse, blot_on }
+            State::Thinking { rx, pulse, blot_on } => match rx.try_recv() {
+                Ok(result) => {
+                    surf.fill_rect(SCREEN_W / 2 - 14, SCREEN_H / 2 - 14, 28, 28, WHITE);
+                    disp.update(SCREEN_W as i32 / 2 - 14, SCREEN_H as i32 / 2 - 14, 28, 28, true);
+                    let text = match result {
+                        Ok(t) => t,
+                        Err(e) => {
+                            eprintln!("riddle: oracle failed: {e}");
+                            "…".to_string()
                         }
-                    }
-                    Err(mpsc::TryRecvError::Disconnected) => {
-                        State::Listening { last_pen: None }
+                    };
+                    let plan = plan_reply(&font, &text);
+                    State::Replying { plan, next: Instant::now() }
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    if pulse.elapsed() >= Duration::from_millis(600) {
+                        let (cx, cy) = (SCREEN_W as i32 / 2, SCREEN_H as i32 / 2);
+                        if blot_on {
+                            surf.fill_rect(cx as usize - 14, cy as usize - 14, 28, 28, WHITE);
+                        } else {
+                            surf.stamp(cx, cy, 9, BLACK);
+                        }
+                        disp.update(cx - 14, cy - 14, 28, 28, true);
+                        State::Thinking { rx, pulse: Instant::now(), blot_on: !blot_on }
+                    } else {
+                        State::Thinking { rx, pulse, blot_on }
                     }
                 }
-            }
+                Err(mpsc::TryRecvError::Disconnected) => State::Listening { last_pen: None },
+            },
 
             State::Replying { mut plan, next } => {
                 if Instant::now() >= next {
-                    // Draw a burst of skeleton points (the hand moves quickly).
-                    let fbuf = client.framebuffer();
                     let mut dirty = BBox::empty();
-                    let mut budget = 26; // points per frame
+                    let mut budget = 26;
                     while budget > 0 && plan.stroke_i < plan.strokes.len() {
                         let stroke = &plan.strokes[plan.stroke_i];
                         if plan.point_i >= stroke.len() {
@@ -288,9 +269,9 @@ fn run() -> std::io::Result<()> {
                         let (x, y) = stroke[plan.point_i];
                         if plan.point_i > 0 {
                             let (px, py) = stroke[plan.point_i - 1];
-                            fb::brush_line(fbuf, px, py, x, y, 2, fb::BLACK);
+                            surf.brush_line(px, py, x, y, 2, BLACK);
                         } else {
-                            fb::stamp(fbuf, x, y, 2, fb::BLACK);
+                            surf.stamp(x, y, 2, BLACK);
                         }
                         dirty.add(x, y, 4);
                         plan.point_i += 1;
@@ -298,10 +279,9 @@ fn run() -> std::io::Result<()> {
                     }
                     if !dirty.is_empty() {
                         let (x, y, w, h) = dirty.rect();
-                        let _ = client.update_partial(x, y, w, h);
+                        disp.update(x, y, w, h, true);
                     }
                     if plan.stroke_i >= plan.strokes.len() {
-                        // Done writing: linger proportional to length.
                         let chars: usize = plan.strokes.iter().map(|s| s.len()).sum();
                         let linger = Duration::from_millis(4000 + (chars as u64) * 2);
                         let region = plan.region;
@@ -323,18 +303,16 @@ fn run() -> std::io::Result<()> {
             }
 
             State::FadingReply { stage, next, region } => {
-                const STAGES: u32 = 5;
+                const STAGES: u32 = 10;
                 if Instant::now() >= next {
-                    let fbuf = client.framebuffer();
-                    ink::dissolve_pass(fbuf, region, stage, STAGES);
+                    ink::dissolve_pass(&mut surf, region, stage, STAGES);
                     let (x, y, w, h) = region.rect();
-                    let _ = client.update_partial(x, y, w, h);
+                    disp.update(x, y, w, h, true);
                     if stage + 1 >= STAGES {
-                        // Clean the ghosts once the page is blank again.
-                        let _ = client.request_full_refresh();
+                        disp.full_refresh(surf.w, surf.h);
                         State::Listening { last_pen: None }
                     } else {
-                        State::FadingReply { stage: stage + 1, next: Instant::now() + Duration::from_millis(140), region }
+                        State::FadingReply { stage: stage + 1, next: Instant::now() + Duration::from_millis(80), region }
                     }
                 } else {
                     State::FadingReply { stage, next, region }
@@ -346,7 +324,7 @@ fn run() -> std::io::Result<()> {
     }
 
     eprintln!("riddle: the diary closes");
-    client.terminate();
+    disp.terminate();
     Ok(())
 }
 
@@ -356,7 +334,6 @@ fn plan_reply(font: &FontRef, text: &str) -> WritePlan {
     let lines = script::wrap(font, text, REPLY_PX, max_w);
     let line_h = (REPLY_PX * 1.25) as i32;
     let total_h = line_h * lines.len() as i32;
-    // Centered block, upper-middle of the page like the film.
     let mut y = ((SCREEN_H as i32 - total_h) / 3).max(60);
     let mut strokes = Vec::new();
     let mut region = BBox::empty();
@@ -373,10 +350,7 @@ fn plan_reply(font: &FontRef, text: &str) -> WritePlan {
         let x0 = (SCREEN_W as i32 - raster.width as i32) / 2;
         let wobble = jitter();
         for s in line_strokes {
-            let mapped: Vec<(i32, i32)> = s
-                .iter()
-                .map(|&(sx, sy)| (x0 + sx, y + sy + wobble))
-                .collect();
+            let mapped: Vec<(i32, i32)> = s.iter().map(|&(sx, sy)| (x0 + sx, y + sy + wobble)).collect();
             for &(x, yy) in &mapped {
                 region.add(x, yy, 5);
             }

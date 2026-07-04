@@ -1,7 +1,8 @@
 //! User ink: capture pen strokes, render them, dissolve them, rasterize them
 //! for the oracle.
 
-use crate::fb::{self, BBox, SCREEN_H, SCREEN_W};
+use crate::fb::BBox;
+use crate::surface::{Surface, BLACK, WHITE};
 
 pub struct Ink {
     /// Finished strokes as point lists (x, y, radius).
@@ -29,13 +30,13 @@ impl Ink {
 
     /// Pen touched down or moved while down, with brush radius already
     /// resolved by the caller. Returns the dirty rect of what was drawn.
-    pub fn pen_point(&mut self, fb_buf: &mut [u8], x: i32, y: i32, r: i32) -> BBox {
+    pub fn pen_point(&mut self, surf: &mut Surface, x: i32, y: i32, r: i32) -> BBox {
         let mut dirty = BBox::empty();
         if let Some(&(px, py, pr)) = self.current.last() {
-            fb::brush_line(fb_buf, px, py, x, y, r.min(pr + 1), fb::BLACK);
+            surf.brush_line(px, py, x, y, r.min(pr + 1), BLACK);
             dirty.add(px, py, pr + 2);
         } else {
-            fb::stamp(fb_buf, x, y, r, fb::BLACK);
+            surf.stamp(x, y, r, BLACK);
         }
         dirty.add(x, y, r + 2);
         self.current.push((x, y, r));
@@ -44,13 +45,13 @@ impl Ink {
     }
 
     /// Eraser tip: brush white over the page.
-    pub fn erase_point(&mut self, fb_buf: &mut [u8], x: i32, y: i32, r: i32) -> BBox {
+    pub fn erase_point(&mut self, surf: &mut Surface, x: i32, y: i32, r: i32) -> BBox {
         let mut dirty = BBox::empty();
         if let Some((px, py)) = self.last_erase {
-            fb::brush_line(fb_buf, px, py, x, y, r, fb::WHITE);
+            surf.brush_line(px, py, x, y, r, WHITE);
             dirty.add(px, py, r + 2);
         } else {
-            fb::stamp(fb_buf, x, y, r, fb::WHITE);
+            surf.stamp(x, y, r, WHITE);
         }
         dirty.add(x, y, r + 2);
         self.last_erase = Some((x, y));
@@ -66,27 +67,24 @@ impl Ink {
 
     /// Rasterize the ink region to a grayscale PNG for the oracle.
     /// Downscales 2x to keep the image small.
-    pub fn to_png(&self, fb_buf: &[u8], path: &str) -> std::io::Result<()> {
+    pub fn to_png(&self, surf: &Surface, path: &str) -> std::io::Result<()> {
         if self.bbox.is_empty() {
             return Err(std::io::Error::other("no ink"));
         }
         let (bx, by, bw, bh) = self.bbox.rect();
-        // Pad the crop a little for context.
         let x0 = (bx - 20).max(0) as usize;
         let y0 = (by - 20).max(0) as usize;
-        let x1 = ((bx + bw + 20) as usize).min(SCREEN_W);
-        let y1 = ((by + bh + 20) as usize).min(SCREEN_H);
+        let x1 = ((bx + bw + 20) as usize).min(surf.w);
+        let y1 = ((by + bh + 20) as usize).min(surf.h);
         let (w, h) = ((x1 - x0) / 2, (y1 - y0) / 2);
 
         let mut gray = vec![0u8; w * h];
         for oy in 0..h {
             for ox in 0..w {
-                // 2x2 box average, extracting luminance from RGB565's green.
                 let mut acc = 0u32;
                 for sy in 0..2 {
                     for sx in 0..2 {
-                        let px = fb::get_px(fb_buf, (x0 + ox * 2 + sx) as i32, (y0 + oy * 2 + sy) as i32);
-                        acc += (((px >> 5) & 0x3f) as u32) * 255 / 63;
+                        acc += surf.luma((x0 + ox * 2 + sx) as i32, (y0 + oy * 2 + sy) as i32) as u32;
                     }
                 }
                 gray[oy * w + ox] = (acc / 4) as u8;
@@ -116,14 +114,14 @@ fn px_hash(x: i32, y: i32) -> u32 {
 
 /// One pass of the "diary drinks the ink" effect: erase the pixels whose hash
 /// falls in this stage. After `stages` passes the region is clean white.
-pub fn dissolve_pass(fb_buf: &mut [u8], region: BBox, stage: u32, stages: u32) {
+pub fn dissolve_pass(surf: &mut Surface, region: BBox, stage: u32, stages: u32) {
     if region.is_empty() {
         return;
     }
     for y in region.y0..=region.y1 {
         for x in region.x0..=region.x1 {
-            if fb::get_px(fb_buf, x, y) != fb::WHITE && px_hash(x, y) % stages <= stage {
-                fb::put_px(fb_buf, x, y, fb::WHITE);
+            if surf.luma(x, y) < 250 && px_hash(x, y) % stages <= stage {
+                surf.put_px(x, y, WHITE);
             }
         }
     }

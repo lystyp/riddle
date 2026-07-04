@@ -11,6 +11,10 @@ signal-hook = "0.3"
 png = "0.17"
 ab_glyph = "0.2"
 
+[features]
+# Link libquill.so (vendor e-ink engine C ABI) for full-takeover mode.
+takeover = []
+
 [profile.release]
 strip = true
 lto = true
