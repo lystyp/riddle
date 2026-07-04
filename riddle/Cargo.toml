@@ -1,0 +1,16 @@
+[package]
+name = "riddle"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "The diary of Tom Riddle, for the reMarkable Paper Pro"
+
+[dependencies]
+libc = "0.2"
+signal-hook = "0.3"
+png = "0.17"
+ab_glyph = "0.2"
+
+[profile.release]
+strip = true
+lto = true
