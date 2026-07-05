@@ -6,6 +6,17 @@ writes itself back in a flowing hand, stroke by stroke, then fades away.
 
 No screen glow, no keyboard, no chat UI. Just ink appearing on paper.
 
+_This is the diary from [the demo](https://x.com/MaximeRivest)._
+
+### 🪄 New to this? Start here
+
+You need a **reMarkable Paper Pro** in developer mode with a launcher installed.
+If that sounds like a lot, it isn't — **[remagic](https://github.com/maximerivest/remagic)**
+walks you through turning on developer mode and sets up everything with one
+command. Come back here, drop riddle in, and start writing to Tom.
+
+Already have xovi + AppLoad? Skip to [Building](#building).
+
 > ⚠️ **This modifies your device.** It runs as root, stops the vendor UI
 > (in takeover mode), and drives the e-ink engine directly. It has only been
 > tested on a **reMarkable Paper Pro** (ferrari, aarch64, OS 3.26–3.27). It may
@@ -38,7 +49,15 @@ No screen glow, no keyboard, no chat UI. Just ink appearing on paper.
   against with `--features takeover`. Includes `scribble`, a minimal
   pen-to-glass latency demo.
 
-Draw a single large **?** on the page to summon the built-in guide.
+## Gestures
+
+| Do this | And |
+|---------|-----|
+| Write, then rest the pen | The diary drinks your ink and Tom replies |
+| Flip the marker | Erase |
+| Draw a large **?** | Summon the built-in guide |
+| Tap five fingers at once | Leave the diary |
+| Power button | The page turns to *"The diary sleeps."*, then the tablet suspends; press again to wake exactly where you were |
 
 ## The oracle (the "spirit" in the diary)
 

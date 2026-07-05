@@ -13,6 +13,7 @@ mod help;
 mod ink;
 mod oracle;
 mod pen;
+mod power;
 mod qtfb;
 mod script;
 mod surface;
@@ -85,6 +86,15 @@ fn run() -> std::io::Result<()> {
     };
     // Takeover mode: touch is ours too; 5-finger tap = quit.
     let mut touch_dev = if takeover { touch::TouchDevice::open().ok() } else { None };
+    // Takeover mode: the power button is ours too (sleep page + suspend).
+    let mut power_dev = if takeover {
+        power::PowerButton::open().map_err(|e| eprintln!("riddle: no power button ({e})")).ok()
+    } else {
+        None
+    };
+    // Ignore power presses briefly after a wake: the waking press itself (and
+    // key bounce) arrives on our grabbed fd and must not re-suspend.
+    let mut power_grace = Instant::now();
 
     let sigterm = Arc::new(AtomicBool::new(false));
     signal_hook::flag::register(signal_hook::consts::SIGTERM, Arc::clone(&sigterm))?;
@@ -131,6 +141,56 @@ fn run() -> std::io::Result<()> {
             if t.drain_check_quit() {
                 eprintln!("riddle: 5-finger quit");
                 break;
+            }
+        }
+
+        // ---- power button: sleep page, suspend, restore on wake ----
+        if let Some(ref mut p) = power_dev {
+            let pressed = p.drain_pressed();
+            if pressed && Instant::now() >= power_grace {
+                eprintln!("riddle: sleeping (power button)");
+                let saved = help::show_sleep(&mut surf, &font);
+                disp.full_refresh(surf.w, surf.h);
+                // Let the flashing refresh finish before the panel loses power.
+                std::thread::sleep(Duration::from_millis(800));
+                // Suspend, and confirm via the kernel's success counter. The
+                // EPD regulator refuses to sleep while its post-update vpdd
+                // timer (≤30s) runs — the whole suspend aborts with "Some
+                // devices failed to suspend" — so retry until it sticks.
+                let count0 = power::suspend_count();
+                let mut attempts = 0;
+                'sleeping: loop {
+                    if p.grabbed {
+                        let _ = std::process::Command::new("systemctl").arg("suspend").status();
+                    }
+                    attempts += 1;
+                    let t0 = Instant::now();
+                    while t0.elapsed() < Duration::from_secs(6) {
+                        std::thread::sleep(Duration::from_millis(400));
+                        if power::suspend_count() > count0 {
+                            break 'sleeping;
+                        }
+                    }
+                    if attempts >= 8 {
+                        eprintln!("riddle: suspend never happened ({attempts} tries); waking the page");
+                        break;
+                    }
+                    eprintln!("riddle: suspend aborted (EPD discharge timer), retrying");
+                }
+                eprintln!("riddle: waking");
+                help::restore_sleep(&mut surf, &saved);
+                disp.full_refresh(surf.w, surf.h);
+                power::wifi_heal();
+                // Discard input that queued while asleep — stale pen events
+                // would otherwise replay as phantom ink on the restored page.
+                if let Some(ref mut pd) = pen_dev {
+                    let _ = pd.drain();
+                }
+                if let Some(ref mut td) = touch_dev {
+                    let _ = td.drain_check_quit();
+                }
+                p.drain_pressed();
+                power_grace = Instant::now() + Duration::from_secs(3);
             }
         }
 

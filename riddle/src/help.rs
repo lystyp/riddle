@@ -167,6 +167,23 @@ impl Help {
     }
 }
 
+/// Replace the page with the full-screen sleep card; returns the saved page
+/// pixels so waking can restore them exactly.
+pub fn show_sleep(surf: &mut Surface, font: &FontRef) -> Vec<u8> {
+    let saved = surf.copy_rect(0, 0, SCREEN_W, SCREEN_H);
+    surf.fill_rect(0, 0, SCREEN_W, SCREEN_H, WHITE);
+    frame(surf, 48, 48, SCREEN_W - 96, SCREEN_H - 96, 4);
+    frame(surf, 66, 66, SCREEN_W - 132, SCREEN_H - 132, 1);
+    let y = SCREEN_H * 38 / 100;
+    blit_centered(surf, font, "The diary sleeps.", 116.0, 0, SCREEN_W, y);
+    blit_centered(surf, font, "Press the button to wake it.", 56.0, 0, SCREEN_W, y + 230);
+    saved
+}
+
+pub fn restore_sleep(surf: &mut Surface, saved: &[u8]) {
+    surf.paste_rect(0, 0, SCREEN_W, SCREEN_H, saved);
+}
+
 fn frame(surf: &mut Surface, x: usize, y: usize, w: usize, h: usize, t: usize) {
     surf.fill_rect(x, y, w, t, BLACK);
     surf.fill_rect(x, y + h - t, w, t, BLACK);
@@ -293,5 +310,45 @@ mod tests {
         // Dismissing must restore the page byte-for-byte.
         panel.dismiss(&mut surf);
         assert_eq!(before, surf.copy_rect(0, 0, w, h), "restore is not exact");
+    }
+
+    #[test]
+    fn sleep_page_renders_and_restores() {
+        let (w, h) = (SCREEN_W, SCREEN_H);
+        let mut buf = vec![0xFFu8; w * h * 4];
+        let ptr = buf.as_mut_ptr();
+        let mut surf = Surface::new(ptr, buf.len(), w, h, w * 4, crate::surface::PixFmt::Rgb32);
+        let font = FontRef::try_from_slice(include_bytes!("../fonts/DancingScript.ttf")).unwrap();
+
+        surf.fill_rect(300, 300, 400, 400, BLACK);
+        let before = surf.copy_rect(0, 0, w, h);
+
+        let saved = show_sleep(&mut surf, &font);
+        let mut black = 0usize;
+        for y in 0..h {
+            for x in 0..w {
+                if surf.luma(x as i32, y as i32) < 128 {
+                    black += 1;
+                }
+            }
+        }
+        assert!(black > 10_000, "sleep page looks empty: {black} dark px");
+
+        let out = std::env::temp_dir().join("riddle-sleep-page.png");
+        let mut gray = vec![0u8; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                gray[y * w + x] = surf.luma(x as i32, y as i32);
+            }
+        }
+        let file = std::fs::File::create(&out).unwrap();
+        let mut enc = png::Encoder::new(std::io::BufWriter::new(file), w as u32, h as u32);
+        enc.set_color(png::ColorType::Grayscale);
+        enc.set_depth(png::BitDepth::Eight);
+        enc.write_header().unwrap().write_image_data(&gray).unwrap();
+        eprintln!("sleep snapshot: {}", out.display());
+
+        restore_sleep(&mut surf, &saved);
+        assert_eq!(before, surf.copy_rect(0, 0, w, h), "sleep restore is not exact");
     }
 }
