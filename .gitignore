@@ -2,3 +2,7 @@ riddle/target/
 quill/build/
 quill/vendor/
 *.log
+
+# never commit a real API key
+riddle/oracle.env
+oracle.env

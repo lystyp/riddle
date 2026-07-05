@@ -11,6 +11,15 @@ restore() {
 }
 trap restore EXIT INT TERM
 
+# Oracle config: put your API key in /home/root/riddle/oracle.env, e.g.
+#   RIDDLE_OPENAI_KEY=sk-...
+#   RIDDLE_OPENAI_BASE=https://api.openai.com/v1     # optional
+#   RIDDLE_OPENAI_MODEL=gpt-4o-mini                  # optional
+# Without it, riddle falls back to the pi backend (if pi is installed).
+if [ -f /home/root/riddle/oracle.env ]; then
+    set -a; . /home/root/riddle/oracle.env; set +a
+fi
+
 systemctl stop xochitl
 rm -f /tmp/epframebuffer.lock      # stale EPD lock blocks the engine
 sleep 1

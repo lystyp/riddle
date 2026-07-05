@@ -58,10 +58,52 @@ struct WritePlan {
 }
 
 fn main() {
+    // Hidden diagnostic: `riddle --oracle-test <image.png>` runs one oracle turn
+    // and prints the streamed chunks, then exits. Lets you verify your endpoint
+    // + key + model before ever launching the diary. No display needed.
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("--oracle-test") {
+        let png = args.get(2).map(String::as_str).unwrap_or("/tmp/riddle-page.png");
+        std::process::exit(oracle_test(png));
+    }
     if let Err(e) = run() {
         eprintln!("riddle: fatal: {e}");
         std::process::exit(1);
     }
+}
+
+fn oracle_test(png: &str) -> i32 {
+    let o = match oracle::Oracle::spawn() {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("oracle spawn failed: {e}");
+            return 1;
+        }
+    };
+    let (tx, rx) = mpsc::channel();
+    let t0 = Instant::now();
+    o.ask(png, tx);
+    let mut got = String::new();
+    loop {
+        match rx.recv() {
+            Ok(Ok(chunk)) => {
+                if got.is_empty() {
+                    eprintln!("first chunk +{}ms", t0.elapsed().as_millis());
+                }
+                print!("{chunk} ");
+                use std::io::Write as _;
+                let _ = std::io::stdout().flush();
+                got.push_str(&chunk);
+            }
+            Ok(Err(e)) => {
+                eprintln!("\noracle error: {e}");
+                return 1;
+            }
+            Err(_) => break, // disconnected = reply complete
+        }
+    }
+    println!("\n--- reply complete ({}ms, {} chars) ---", t0.elapsed().as_millis(), got.len());
+    if got.trim().is_empty() { 1 } else { 0 }
 }
 
 fn run() -> std::io::Result<()> {

@@ -61,14 +61,48 @@ Already have xovi + AppLoad? Skip to [Building](#building).
 
 ## The oracle (the "spirit" in the diary)
 
-Replies come from a resident LLM agent process on the device
-(`riddle/src/oracle.rs` spawns [`pi`](https://github.com/badlogic/pi-mono) in
-RPC mode and keeps it warm, so each turn pays only model latency — first ink
-lands ~1.4 s after the page commits). The committed page is sent as an inline
-PNG; the model reads your handwriting directly.
+The diary's replies come from a vision LLM that reads your handwriting from the
+committed page (sent as an inline PNG). There are **two backends**, chosen at
+startup — pick whichever you have:
 
-You can swap in any backend by editing `oracle.rs`: anything that accepts an
-image and streams text back will do. The persona prompt lives in the same file.
+### Option A — any OpenAI-compatible API (easiest, zero setup)
+
+Set an API key and riddle talks straight to an OpenAI-compatible
+`/chat/completions` endpoint. Works with OpenAI, OpenRouter, Groq, a local
+server — anything that speaks the format. No extra software on the tablet.
+
+```sh
+export RIDDLE_OPENAI_KEY="sk-..."                       # required
+export RIDDLE_OPENAI_BASE="https://api.openai.com/v1"   # optional (default)
+export RIDDLE_OPENAI_MODEL="gpt-4o-mini"                # optional; must see images
+```
+
+Any vision-capable model works. Example with OpenRouter:
+
+```sh
+export RIDDLE_OPENAI_KEY="$OPENROUTER_API_KEY"
+export RIDDLE_OPENAI_BASE="https://openrouter.ai/api/v1"
+export RIDDLE_OPENAI_MODEL="openai/gpt-4o-mini"
+```
+
+Verify your setup before launching the diary:
+
+```sh
+riddle --oracle-test path/to/handwriting.png   # prints the streamed reply
+```
+
+Measured ~0.9–1.1 s to first ink on-device. The HTTPS is built into riddle
+(pure-Rust, no extra libraries).
+
+### Option B — pi (the power path)
+
+If you already run [`pi`](https://github.com/badlogic/pi-mono), riddle will use
+a resident `pi --mode rpc` process kept warm (Node + your subscription auth
+loaded once), so each turn pays only model latency. Used automatically when
+`RIDDLE_OPENAI_KEY` is **not** set.
+
+Both stream the reply sentence-by-sentence, so the quill starts writing seconds
+before the model finishes. The persona prompt lives in `riddle/src/oracle.rs`.
 
 ## Building
 

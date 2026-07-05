@@ -10,6 +10,9 @@ libc = "0.2"
 signal-hook = "0.3"
 png = "0.17"
 ab_glyph = "0.2"
+# HTTP + TLS for the OpenAI-compatible oracle backend. Pure Rust (rustls), no
+# OpenSSL/C — keeps the binary self-contained and cross-compiles cleanly.
+ureq = { version = "2.10", default-features = false, features = ["tls"] }
 
 [features]
 # Link libquill.so (vendor e-ink engine C ABI) for full-takeover mode.
