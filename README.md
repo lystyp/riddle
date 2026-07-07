@@ -80,6 +80,8 @@ pen. (Or install it from the **Store** app right on the tablet.)
 | Do this | And |
 |---------|-----|
 | Write, then rest the pen | The diary drinks your ink and Tom replies |
+| Write *"show me what I wrote about…"* | The remembered page **rises through the paper**: the date, your own handwriting rewriting itself stroke by stroke, Tom's old reply — all in faded ink. Touch the pen anywhere and today's page returns |
+| Write *"what do you remember?"* | Tom answers with a handwritten list of remembered moments |
 | Flip the marker | Erase |
 | Draw a large **?** | Summon the built-in guide |
 | Tap five fingers at once | Leave the diary *(takeover mode)* |
@@ -87,6 +89,25 @@ pen. (Or install it from the **Store** app right on the tablet.)
 
 In the windowed (qtfb) flavour, xochitl keeps the touchscreen and the power
 button: close the diary from AppLoad instead.
+
+## The diary remembers
+
+Every finished page is kept — your actual pen strokes, a transcription, and
+Tom's reply — so the diary can do three things:
+
+- **Follow the conversation.** Recent pages ride along with each request, so
+  Tom remembers what you wrote yesterday (both backends, same behavior).
+- **Conjure the past.** Ask in ink — *"show me the page about the garden"*,
+  *"find what I wrote on Tuesday"* — and the diary rewrites that page in
+  front of you, in your own hand, dated, in faded ink. No buttons, no lists,
+  no chrome: the pen is the only interface.
+- **Answer from memory.** *"What do you remember?"* gets a handwritten index.
+
+Memories live only on the tablet, in plain files under
+`/home/root/riddle-data/memories` (delete the folder and the diary forgets;
+the last ~400 pages are kept). `RIDDLE_MEMORY=off` in `oracle.env` turns all
+of it off — no storage, and nothing extra sent with requests. Set
+`RIDDLE_TZ_OFFSET` (hours from UTC) so memory dates read right.
 
 ## The oracle (the "spirit" in the diary)
 

@@ -25,6 +25,8 @@ unsafe impl Send for Surface {}
 
 pub const WHITE: u16 = 0xFFFF;
 pub const BLACK: u16 = 0x0000;
+/// Old ink: how the diary writes its memories (a readable e-ink gray).
+pub const FADED: u16 = 0x7BCF;
 
 #[inline]
 fn expand565(c: u16) -> (u8, u8, u8) {

@@ -35,6 +35,20 @@
       "kind": "text",
       "placeholder": "2000",
       "help": "Runaway guard. Thinking models count hidden reasoning tokens against it — keep it roomy."
+    },
+    {
+      "key": "RIDDLE_MEMORY",
+      "label": "The diary remembers",
+      "kind": "select",
+      "options": ["", "off"],
+      "help": "When on (default), the diary keeps your pages on the tablet, Tom follows the conversation, and \"show me…\" conjures past pages. \"off\" disables all of it."
+    },
+    {
+      "key": "RIDDLE_TZ_OFFSET",
+      "label": "Timezone offset",
+      "kind": "text",
+      "placeholder": "-4",
+      "help": "Hours from UTC, so the dates of conjured memories read right."
     }
   ],
   "presets": [
