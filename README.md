@@ -38,12 +38,15 @@ pen. (Or install it from the **Store** app right on the tablet.)
 3. Add an API key: `cp oracle.env.example oracle.env` in that folder and put your `RIDDLE_OPENAI_KEY` in it (any OpenAI-compatible key). Or skip it to use [pi](#option-b--pi-the-power-path).
 4. In **AppLoad**: tap **Reload**, then **The Diary**. Write, and rest your pen.
 
-> ⚠️ **This modifies your device.** It runs as root, stops the vendor UI
-> (in takeover mode), and drives the e-ink engine directly. It has only been
-> tested on a **reMarkable Paper Pro** (ferrari, aarch64, OS 3.26–3.27). It may
-> not work on other models or OS versions, and you use it entirely at your own
-> risk. Not affiliated with reMarkable AS. Keep SSH access working before you
-> install anything — that is your escape hatch.
+> ⚠️ **This modifies your device.** The prebuilt bundle and the catalog build
+> run in **takeover mode**: tapping The Diary stops the whole reMarkable UI
+> and takes the screen. Leave with a **5-finger tap** — xochitl restarts
+> automatically. It runs as root and drives the e-ink engine directly. It has
+> only been tested on a **reMarkable Paper Pro** (ferrari, aarch64,
+> OS 3.26–3.27). It may not work on other models or OS versions, and you use
+> it entirely at your own risk. Not affiliated with reMarkable AS. Keep SSH
+> access working before you install anything — if anything ever wedges:
+> `ssh root@10.11.99.1 'systemctl start xochitl'`.
 
 ## How it works
 
@@ -55,9 +58,10 @@ pen. (Or install it from the **Store** app right on the tablet.)
    │                                          streams reply sentence-by-sentence)
    ▼ strokes (Dancing Script → skeletonized to single-pixel pen paths)
  display backend
-   ├── qtfb        — windowed, inside xochitl (AppLoad app)
+   ├── qtfb        — windowed, inside xochitl (build-from-source flavour)
    └── quill       — full takeover: xochitl stopped, vendor e-ink engine
-                     driven directly for instant ink (lowest latency there is)
+                     driven directly for instant ink (lowest latency there
+                     is; what the prebuilt bundle runs)
 ```
 
 - **`riddle/`** — the app (Rust). Pen input, ink surface, handwriting
@@ -78,8 +82,11 @@ pen. (Or install it from the **Store** app right on the tablet.)
 | Write, then rest the pen | The diary drinks your ink and Tom replies |
 | Flip the marker | Erase |
 | Draw a large **?** | Summon the built-in guide |
-| Tap five fingers at once | Leave the diary |
-| Power button | The page turns to *"The diary sleeps."*, then the tablet suspends; press again to wake exactly where you were |
+| Tap five fingers at once | Leave the diary *(takeover mode)* |
+| Power button | The page turns to *"The diary sleeps."*, then the tablet suspends; press again to wake exactly where you were *(takeover mode)* |
+
+In the windowed (qtfb) flavour, xochitl keeps the touchscreen and the power
+button: close the diary from AppLoad instead.
 
 ## The oracle (the "spirit" in the diary)
 
@@ -132,26 +139,41 @@ Measured ~0.9–1.1 s to first ink on-device. The HTTPS is built into riddle
 If you already run [`pi`](https://github.com/badlogic/pi-mono), riddle will use
 a resident `pi --mode rpc` process kept warm (Node + your subscription auth
 loaded once), so each turn pays only model latency. Used automatically when
-`RIDDLE_OPENAI_KEY` is **not** set.
+`RIDDLE_OPENAI_KEY` is **not** set. Defaults (override in `oracle.env`):
+pi at `/home/root/node/bin` (`RIDDLE_PI_BIN_DIR`), provider `openai-codex`
+(`RIDDLE_PI_PROVIDER`), model `gpt-5.4-mini` (`RIDDLE_PI_MODEL`).
 
 Both stream the reply sentence-by-sentence, so the quill starts writing seconds
 before the model finishes. The persona prompt lives in `riddle/src/oracle.rs`.
+
+A note on Tom's memory: with the HTTP backend every page is a fresh
+conversation — Tom does not remember your previous page. With pi, the warm
+session remembers everything since the diary was opened (and pi persists
+that session in its own data dir on the tablet).
+
+If the oracle can't answer — missing key, refused key, no Wi-Fi — Tom writes
+the reason on the page instead of a reply, and the full error goes to the
+journal (`journalctl -u riddle-takeover`).
 
 ## Building
 
 Cross-compiled from x86_64. Two flavours:
 
-### Windowed (AppLoad/qtfb) — easiest
+### Windowed (AppLoad/qtfb) — build from source
 
-Requires [xovi + AppLoad](https://github.com/asivery/rm-appload) on the device.
+The bundles above are the takeover flavour; the windowed flavour must be
+built. Requires [xovi + AppLoad](https://github.com/asivery/rm-appload) on
+the device.
 
 ```sh
 cd riddle
 cargo build --release --target aarch64-unknown-linux-gnu
 ```
 
-Install to `/home/root/xovi/exthome/appload/riddle/` with
-`external.manifest.json`, `appload-launch.sh`, and the binary.
+Install the binary to `/home/root/xovi/exthome/appload/riddle/` with an
+`external.manifest.json` that sets `"qtfb": true` and points `"application"`
+at the binary itself (the manifest in this repo is the takeover one — AppLoad
+only hands riddle a window, via `QTFB_KEY`, when `qtfb` is true).
 
 ### Takeover (instant ink) — the one from the demo
 
@@ -171,9 +193,23 @@ scripts, manifest) — copy it to
 `/home/root/xovi/exthome/appload/riddle/`, or publish it to the catalog with
 `remagic publish dist/riddle`. Launching via AppLoad (`appload-launch.sh`)
 detaches into a transient systemd unit, stops xochitl, runs the diary, and
-**always restores xochitl on exit** — exit with the power button, a 5-finger
-tap, or SIGTERM. If anything wedges:
+**always restores xochitl on exit** — leave with a 5-finger tap or SIGTERM
+(`systemctl stop riddle-takeover`); the power button sleeps and wakes the
+diary without leaving it. The unit's stop hook restarts xochitl even if
+riddle dies uncleanly. If anything wedges:
 `ssh root@10.11.99.1 'systemctl start xochitl'`.
+
+## What leaves the device
+
+- Each committed page is rasterized to a small grayscale PNG and sent to the
+  oracle **you** configured — nothing else ever leaves the tablet, and there
+  is no telemetry.
+- The PNG (`/tmp/riddle-page.png`) is deleted as soon as the oracle has read
+  it; set `RIDDLE_KEEP_PAGE=1` to keep the last page around for debugging.
+- riddle never writes replies to disk. The pi backend, however, keeps its own
+  session history in its data dir — the HTTP backend keeps nothing.
+- Tom stays in character by design: the persona prompt (see
+  `riddle/src/oracle.rs`) tells the model it is the diary and nothing else.
 
 ## Fonts
 
