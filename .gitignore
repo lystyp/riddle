@@ -7,3 +7,5 @@ quill/vendor/
 riddle/oracle.env
 oracle.env
 riddle/dist/
+drawlab/dist/
+home/dist/
