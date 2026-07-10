@@ -481,11 +481,13 @@ class TomView(context: Context) : View(context) {
     // ≥0 while the send-time drink is dissolving the text layer; the reply
     // fast-forwards it (finishDrink) so ink never lands on dissolving words.
     private var drinkStage = -1
+    private var drinkRegion: Rect? = null
 
     private val drinkTicker = object : Runnable {
         override fun run() {
             if (drinkStage < 0) return
-            dissolveRegionPass(textBmp, Rect(0, 0, width, height), drinkStage)
+            val reg = drinkRegion ?: run { finishDrink(); return }
+            dissolveRegionPass(textBmp, reg, drinkStage)
             drinkStage++
             if (drinkStage >= dissolveStages) finishDrink()
             else ui.postDelayed(this, dissolveTickMs)
@@ -500,8 +502,42 @@ class TomView(context: Context) : View(context) {
         // The staged passes leave nothing by the last stage; the erase is
         // the one-gulp path for a reply that outran the animation.
         textBmp?.eraseColor(Color.TRANSPARENT)
-        Epd.partial(this, 0, 0, width, height, refreshMode)
+        drinkRegion?.let { Epd.partial(this, it.left, it.top, it.right, it.bottom, refreshMode) }
+        drinkRegion = null
         status("the page is thinking…")
+    }
+
+    /**
+     * Bounding box of every inked pixel on the layer, read from the bitmap
+     * itself. The drink dissolves exactly this box — scanning the pixels
+     * beats bookkeeping the input paths (touch, raw pen, replayed taps can
+     * each forget to report), and a small box is what keeps the staged
+     * dissolve visible on e-ink: a full-screen partial per stage outruns
+     * the panel and the fade collapses into one blink.
+     */
+    private fun inkBounds(bmp: Bitmap?): Rect? {
+        val b = bmp ?: return null
+        val w = b.width
+        val h = b.height
+        val px = IntArray(w * h)
+        b.getPixels(px, 0, w, 0, 0, w, h)
+        var l = w
+        var t = h
+        var r = -1
+        var btm = -1
+        var i = 0
+        for (y in 0 until h) {
+            for (x in 0 until w) {
+                if (px[i++] ushr 24 != 0) {
+                    if (x < l) l = x
+                    if (x > r) r = x
+                    if (y < t) t = y
+                    if (y > btm) btm = y
+                }
+            }
+        }
+        if (r < l) return null
+        return Rect(l, t, r + 1, btm + 1)
     }
 
     private val commitCheck = Runnable {
@@ -525,9 +561,10 @@ class TomView(context: Context) : View(context) {
         turnWrote = false
         phase = Phase.THINKING
         hasUserInk = false
-        // The snapshot has the words now — the page drinks the WHOLE text
-        // layer while the request flies. Full-layer, no region bookkeeping:
-        // whatever is written there dissolves, unconditionally.
+        // The snapshot has the words now — the page drinks the text layer
+        // while the request flies. The box comes from the pixels themselves
+        // (inkBounds), so whatever was written there dissolves.
+        drinkRegion = inkBounds(textBmp)?.apply { inset(-8, -8) }
         drinkStage = 0
         ui.post(drinkTicker)
         status("the page drinks your words…")
@@ -998,6 +1035,7 @@ class TomView(context: Context) : View(context) {
         nextY = -1
         hasUserInk = false
         drinkStage = -1 // a still-queued drinkTicker no-ops once negative
+        drinkRegion = null
     }
 
     private fun growFadeRegion(x: Int, y: Int, margin: Int) {
