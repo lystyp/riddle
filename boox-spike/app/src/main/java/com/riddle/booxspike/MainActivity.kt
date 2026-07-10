@@ -45,6 +45,12 @@ class MainActivity : Activity() {
             setTextColor(Color.BLACK)
             setBackgroundColor(Color.WHITE)
             setPadding(16, 4, 16, 4)
+            // Pinned to two lines: a status re-wrapping between one and two
+            // lines resizes TomView, and a resize cancels every scheduled
+            // callback on the page (commit countdown, drink animation).
+            minLines = 2
+            maxLines = 2
+            ellipsize = android.text.TextUtils.TruncateAt.END
             text = if (cfg != null) {
                 "oracle ready (${cfg.model}) — 畫筆層作畫、雙擊筆切文字層寫話，停筆等回應"
             } else {
@@ -134,8 +140,13 @@ class MainActivity : Activity() {
             setBackgroundColor(Color.WHITE)
             addView(row, LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+            // Fixed pixel height, not WRAP_CONTENT: even at minLines=2 the
+            // measured height differs ~2px between CJK and Latin messages,
+            // and that 2px re-layout of TomView lands ~40ms after every
+            // commit — killing the drink animation it just started.
             addView(status, LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                (48 * resources.displayMetrics.density).toInt()))
             addView(tom, LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f))
         }

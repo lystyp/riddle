@@ -137,6 +137,12 @@ class TomView(context: Context) : View(context) {
     override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
         super.onSizeChanged(w, h, oldw, oldh)
         if (w <= 0 || h <= 0) return
+        // Resizes are rare but lethal: removeCallbacksAndMessages cancels
+        // the commit countdown and the drink mid-animation. Log every one —
+        // an unexplained dead turn should be traceable to this line.
+        Log.i(TAG, "onSizeChanged ${oldw}x$oldh → ${w}x$h (phase=$phase)")
+        val hadInk = hasUserInk
+        val owedGulp = drinkStage >= 0
         ui.removeCallbacksAndMessages(null)
         phase = Phase.IDLE
         resetPlan()
@@ -145,6 +151,15 @@ class TomView(context: Context) : View(context) {
         // may empty the pen layer.
         penBmp = remapLayer(penBmp, w, h).also { penPage = Canvas(it) }
         textBmp = remapLayer(textBmp, w, h).also { textPage = Canvas(it) }
+        // The callbacks died with the resize; the turn must not die too.
+        if (owedGulp) {
+            // Mid-drink: the words were already sent — finish the swallow.
+            textBmp?.eraseColor(Color.TRANSPARENT)
+        } else if (hadInk) {
+            // Mid-countdown: re-arm the commit the resize just cancelled.
+            hasUserInk = true
+            scheduleCommit()
+        }
     }
 
     private fun remapLayer(old: Bitmap?, w: Int, h: Int): Bitmap {
