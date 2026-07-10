@@ -137,33 +137,42 @@ class TomView(context: Context) : View(context) {
     override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
         super.onSizeChanged(w, h, oldw, oldh)
         if (w <= 0 || h <= 0) return
-        // Resizes are rare but lethal: removeCallbacksAndMessages cancels
-        // the commit countdown and the drink mid-animation. Log every one —
-        // an unexplained dead turn should be traceable to this line.
+        // Resizes are rare but disruptive: removeCallbacksAndMessages cancels
+        // whatever the turn had queued. Log every one — an unexplained dead
+        // turn should be traceable to this line.
         Log.i(TAG, "onSizeChanged ${oldw}x$oldh → ${w}x$h (phase=$phase)")
-        val hadInk = hasUserInk
-        val owedGulp = drinkStage >= 0
+        // A held tap dot must land before its commit timer is cleared.
+        commitPendingTap()
         ui.removeCallbacksAndMessages(null)
-        phase = Phase.IDLE
-        resetPlan()
         // The layers survive a re-layout (Hide/chrome toggles resize the
-        // view): ink is anchored top-left into the new bitmaps. Only Clear
+        // view): ink stays anchored top-left, and bitmaps only ever grow, so
+        // ink below the fold reappears when the view grows back. Only Clear
         // may empty the pen layer.
         penBmp = remapLayer(penBmp, w, h).also { penPage = Canvas(it) }
         textBmp = remapLayer(textBmp, w, h).also { textPage = Canvas(it) }
-        // The callbacks died with the resize; the turn must not die too.
-        if (owedGulp) {
-            // Mid-drink: the words were already sent — finish the swallow.
-            textBmp?.eraseColor(Color.TRANSPARENT)
-        } else if (hadInk) {
-            // Mid-countdown: re-arm the commit the resize just cancelled.
-            hasUserInk = true
-            scheduleCommit()
+        // Planned coordinates are page-space and the page keeps its top-left
+        // anchor, so the turn resumes exactly where the resize cut it: just
+        // re-arm the callback the phase was waiting on.
+        when (phase) {
+            Phase.IDLE -> if (hasUserInk) scheduleCommit()
+            Phase.THINKING -> if (drinkStage >= 0) ui.post(drinkTicker)
+            Phase.WRITING -> ui.post(ticker)
+            Phase.LINGERING -> ui.postDelayed(startDissolve, 2000)
+            Phase.DISSOLVING -> ui.post(dissolveTicker)
         }
     }
 
+    /**
+     * Grow-only: the new bitmap is at least as large as both the view and
+     * the old bitmap, so a shrink (chrome coming back) crops nothing — the
+     * hidden band returns with the next Hide. Reused as-is when already big
+     * enough.
+     */
     private fun remapLayer(old: Bitmap?, w: Int, h: Int): Bitmap {
-        val next = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+        val tw = max(w, old?.width ?: 0)
+        val th = max(h, old?.height ?: 0)
+        if (old != null && old.width == tw && old.height == th) return old
+        val next = Bitmap.createBitmap(tw, th, Bitmap.Config.ARGB_8888)
         next.eraseColor(Color.TRANSPARENT)
         old?.let {
             Canvas(next).drawBitmap(it, 0f, 0f, null)
@@ -211,6 +220,7 @@ class TomView(context: Context) : View(context) {
             MotionEvent.ACTION_POINTER_DOWN -> {
                 // A second finger landed: chrome-restore gesture, not ink.
                 if (event.pointerCount >= 2) {
+                    Log.i(TAG, "two-finger tap → chrome restore")
                     inking = false
                     tapCandidate = false
                     tapSamples.clear()

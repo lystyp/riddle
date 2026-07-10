@@ -30,6 +30,22 @@ class MainActivity : Activity() {
     private var paceI = 0
     private var penVariantI = 0
 
+    private var chromeHidden = false
+    private var restoreChrome: (() -> Unit)? = null
+
+    // The back gesture / nav-ball back is the dependable way out of
+    // full-screen (a two-finger tap can be swallowed by system gestures or
+    // a touch-disabled panel): it restores the chrome instead of quitting.
+    @Deprecated("Deprecated in Java")
+    override fun onBackPressed() {
+        if (chromeHidden) {
+            restoreChrome?.invoke()
+        } else {
+            @Suppress("DEPRECATION")
+            super.onBackPressed()
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         if (Build.VERSION.SDK_INT >= 28) {
@@ -75,6 +91,8 @@ class MainActivity : Activity() {
         // Full-screen: hide all chrome (ours + system bars); a two-finger tap
         // on the page brings it back (cousin of riddle's 5-finger exit tap).
         fun setChrome(hidden: Boolean) {
+            chromeHidden = hidden
+            android.util.Log.i("riddle-spike", "setChrome hidden=$hidden")
             row.visibility = if (hidden) android.view.View.GONE else android.view.View.VISIBLE
             status.visibility = if (hidden) android.view.View.GONE else android.view.View.VISIBLE
             window.insetsController?.let { ctl ->
@@ -93,6 +111,7 @@ class MainActivity : Activity() {
             }
         }
         tom.onChromeRestore = { runOnUiThread { setChrome(false) } }
+        restoreChrome = { setChrome(false) }
 
         row.apply {
             addView(btn("Write") {
