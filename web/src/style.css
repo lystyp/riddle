@@ -1,0 +1,75 @@
+/* Tom's hand, single-sourced from boox-spike's assets (same TTFs the
+ * tablet renders with). Caveat carries the Latin script; LXGW WenKai TC
+ * is the handwritten 楷體 fallback that catches CJK replies. */
+@font-face {
+  font-family: "Caveat";
+  src: url("../../boox-spike/app/src/main/assets/Caveat.ttf") format("truetype");
+}
+@font-face {
+  font-family: "LXGW WenKai TC";
+  src: url("../../boox-spike/app/src/main/assets/LXGWWenKaiTC.ttf") format("truetype");
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  height: 100%;
+  background: #fff;
+  font-family: system-ui, sans-serif;
+}
+
+body {
+  display: flex;
+  flex-direction: column;
+}
+
+#chrome {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  border-bottom: 1px solid #ddd;
+  font-size: 13px;
+}
+
+#chrome button {
+  font-size: 13px;
+  padding: 3px 12px;
+}
+
+#status {
+  color: #444;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+#page {
+  flex: 1;
+  min-height: 0;
+  width: 100%;
+  cursor: crosshair;
+  /* The page owns every pointer gesture — no scroll/zoom stealing strokes. */
+  touch-action: none;
+}
+
+#oracle-dialog {
+  width: min(560px, 90vw);
+}
+
+#oracle-dialog textarea {
+  width: 100%;
+  font-family: ui-monospace, monospace;
+  font-size: 12px;
+}
+
+#oracle-dialog .row {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 8px;
+}

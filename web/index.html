@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>riddle web — the diary in a browser tab</title>
+  </head>
+  <body>
+    <div id="chrome">
+      <button id="write">Write</button>
+      <button id="clear">Clear</button>
+      <button id="oracle">Oracle…</button>
+      <span id="status">loading Tom's hand…</span>
+    </div>
+    <canvas id="page"></canvas>
+    <dialog id="oracle-dialog">
+      <form method="dialog">
+        <p>
+          貼上 oracle.env 的內容（同 riddle/boox 的變數名，存在
+          localStorage，只有這台瀏覽器看得到）：
+        </p>
+        <textarea
+          id="oracle-env"
+          rows="6"
+          spellcheck="false"
+          placeholder="RIDDLE_OPENAI_KEY=sk-...&#10;RIDDLE_OPENAI_BASE=https://api.openai.com/v1&#10;RIDDLE_OPENAI_MODEL=gpt-4o-mini&#10;RIDDLE_OPENAI_MAX_TOKENS=2000&#10;RIDDLE_OPENAI_REASONING="
+        ></textarea>
+        <div class="row">
+          <button value="cancel">Cancel</button>
+          <button value="save" id="oracle-save">Save</button>
+        </div>
+      </form>
+    </dialog>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
