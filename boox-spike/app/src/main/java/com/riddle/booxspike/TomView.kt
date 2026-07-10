@@ -608,11 +608,51 @@ class TomView(context: Context) : View(context) {
         })
     }
 
+    /** Grid pitch on the snapshot, in snapshot pixels; labels every 2nd line. */
+    private val gridStepPx = 50
+
+    /**
+     * The measuring grid the oracle reads positions from — printed on the
+     * snapshot ONLY, never the page. Vision models misplace absolute
+     * positions on blank paper by ~7% of the frame; a printed ruler in the
+     * reply's own coordinate space cut that ~3x in bench runs (gpt-5.5,
+     * reasoning effort low). Drawn under the ink so page content wins.
+     */
+    private fun drawMeasuringGrid(c: Canvas, w: Int, h: Int) {
+        val line = Paint().apply {
+            color = Color.rgb(0xBB, 0xBB, 0xBB)
+            strokeWidth = 1f
+        }
+        val label = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.rgb(0x88, 0x88, 0x88)
+            textSize = 13f
+        }
+        var x = gridStepPx
+        while (x < w) {
+            c.drawLine(x.toFloat(), 0f, x.toFloat(), h.toFloat(), line)
+            if (x % (2 * gridStepPx) == 0) {
+                c.drawText(x.toString(), x + 3f, 14f, label)
+                c.drawText(x.toString(), x + 3f, h - 4f, label)
+            }
+            x += gridStepPx
+        }
+        var y = gridStepPx
+        while (y < h) {
+            c.drawLine(0f, y.toFloat(), w.toFloat(), y.toFloat(), line)
+            if (y % (2 * gridStepPx) == 0) {
+                c.drawText(y.toString(), 3f, y - 3f, label)
+                c.drawText(y.toString(), w - 34f, y - 3f, label)
+            }
+            y += gridStepPx
+        }
+    }
+
     /**
      * The whole page, both layers over white, downscaled to ≤800px on the
-     * long side. Full-page (not cropped to the ink) because the model's
-     * 100×100 reply grid spans the full page — a crop would shear the
-     * mapping between what it sees and where it draws.
+     * long side. Full-page (not cropped to the ink) because the reply's
+     * coordinates live in this exact frame — a crop would shear the mapping
+     * between what the model sees and where it draws. The measuring grid is
+     * printed under the ink (see drawMeasuringGrid).
      */
     private fun capturePagePng(): Oracle.Snapshot? {
         val pen = penBmp ?: return null
@@ -624,6 +664,7 @@ class TomView(context: Context) : View(context) {
         val snap = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
         val c = Canvas(snap)
         c.drawColor(Color.WHITE)
+        drawMeasuringGrid(c, w, h)
         val filter = Paint(Paint.FILTER_BITMAP_FLAG)
         val src = Rect(0, 0, width, height)
         val dst = Rect(0, 0, w, h)
@@ -660,6 +701,9 @@ class TomView(context: Context) : View(context) {
         // SEE is memory, not ink — it must not count as a visible reply, or
         // a notes-only turn would leave the page stuck thinking forever.
         if (block is ReplyDsl.See) return
+        // Drawing-only mode: TEXT was retired from the protocol. A block from
+        // a disobedient model is logged (above) but never reaches the page.
+        if (block is ReplyDsl.Text) return
         turnWrote = true
         ink(block)
     }
@@ -690,12 +734,19 @@ class TomView(context: Context) : View(context) {
         writeExcuse(reason)
     }
 
+    /**
+     * Drawing-only mode: failures speak through the status line, never the
+     * page — the page carries nothing but ink. Restores IDLE so the pen and
+     * the next turn are not left hostage to a dead request.
+     */
     private fun writeExcuse(reason: String) {
         turnWrote = true
-        write(excuseFor(reason))
+        phase = Phase.IDLE
+        rawPen?.setPaused(false)
+        status(excuseFor(reason))
     }
 
-    /** Stay on the page, keep the clue. */
+    /** Stay in character, keep the clue. */
     private fun excuseFor(reason: String): String =
         "The ink blurs and will not settle… (${reason.take(80)})"
 

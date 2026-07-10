@@ -99,9 +99,10 @@ class OracleTest {
         assertTrue(first.contains("everything"))
         assertTrue(later.contains("new"))
 
-        // 斷言：兩者都誠實報出快照的像素座標框（模型畫圖的依據）
+        // 斷言：兩者都誠實報出快照的像素座標框（模型畫圖的依據）；
+        // drawing-only 模式下不再提 TEXT 行高
         assertTrue(first.contains("632x725"))
         assertTrue(later.contains("632x725"))
-        assertTrue(first.contains("47"))
+        assertTrue(!first.contains("TEXT line"))
     }
 }
