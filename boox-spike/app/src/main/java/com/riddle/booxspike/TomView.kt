@@ -11,6 +11,7 @@ import android.graphics.Typeface
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
+import android.util.Log
 import android.view.MotionEvent
 import android.view.View
 import java.nio.ByteBuffer
@@ -19,6 +20,8 @@ import kotlin.math.hypot
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
+
+private const val TAG = "riddle-spike"
 
 /**
  * The page, as two stacked layers of ink:
@@ -544,7 +547,14 @@ class TomView(context: Context) : View(context) {
         val out = java.io.ByteArrayOutputStream()
         snap.compress(Bitmap.CompressFormat.PNG, 100, out)
         snap.recycle()
-        return out.toByteArray()
+        val bytes = out.toByteArray()
+        // Debug paper trail: exactly what the oracle saw this turn,
+        // adb-pullable from files/last-page.png (overwritten every commit).
+        runCatching {
+            java.io.File(context.getExternalFilesDir(null), "last-page.png").writeBytes(bytes)
+        }.onFailure { Log.w(TAG, "last-page.png save failed", it) }
+        Log.i(TAG, "sent page ${w}x$h (${bytes.size}B) → files/last-page.png")
+        return bytes
     }
 
     private val drinkTicker = object : Runnable {
@@ -578,6 +588,10 @@ class TomView(context: Context) : View(context) {
     }
 
     private fun onOracleBlock(block: ReplyDsl.Block) {
+        // Grid-space paper trail: what the model SAID, before any mapping —
+        // pair with the planText/planStroke px lines to split blame between
+        // the model's coordinates and our rendering.
+        Log.i(TAG, "oracle block: ${describe(block)}")
         if (!oracleActive) return
         if (phase == Phase.DRINKING) {
             pendingBlocks.add(block)
@@ -587,13 +601,28 @@ class TomView(context: Context) : View(context) {
         }
     }
 
+    /** Grid-space digest of one reply block, for the logcat paper trail. */
+    private fun describe(block: ReplyDsl.Block): String = when (block) {
+        is ReplyDsl.Text -> "TEXT(${block.x}, ${block.y}) \"${clip(block.text)}\""
+        is ReplyDsl.See -> "SEE \"${clip(block.text)}\""
+        is ReplyDsl.Stroke -> {
+            val xs = block.points.map { it.x }
+            val ys = block.points.map { it.y }
+            "STROKE ${block.points.size}pts " +
+                "grid(${xs.min()},${ys.min()})→(${xs.max()},${ys.max()})"
+        }
+    }
+
+    private fun clip(s: String): String =
+        s.replace("\n", "⏎").let { if (it.length > 80) it.take(80) + "…" else it }
+
     private fun onOracleDone() {
         oracleActive = false
         if (phase == Phase.THINKING && !turnWrote) writeExcuse("empty reply")
     }
 
     private fun onOracleError(reason: String) {
-        android.util.Log.w("riddle-spike", "oracle error: $reason")
+        Log.w(TAG, "oracle error: $reason")
         oracleActive = false
         if (phase == Phase.DRINKING) {
             pendingExcuse = excuseFor(reason)
@@ -739,6 +768,7 @@ class TomView(context: Context) : View(context) {
         val lines = wrap(paint, block.text, maxW)
         var y = (block.y / ReplyDsl.GRID * height).toInt()
             .coerceIn(0, max(0, height - lineH * lines.size))
+        Log.i(TAG, "text → px x0=$x0 y=$y, ${lines.size} line(s) (page ${width}x$height)")
         for (lineText in lines) {
             planTextLine(paint, lineText, x0, y)
             y += lineH
@@ -762,11 +792,18 @@ class TomView(context: Context) : View(context) {
     /** A STROKE block: grid polyline → page pixels → hand-paced dense path. */
     private fun planStroke(block: ReplyDsl.Stroke) {
         jitter() // advance the shared LCG so each stroke wobbles differently
+        val mapped = ReplyDsl.mapToCanvas(block.points, width, height)
         val dense = ReplyDsl.densify(
-            ReplyDsl.mapToCanvas(block.points, width, height),
+            mapped,
             spacingPx = max(1, (2 * sc).roundToInt()),
             wobblePx = 1.5f * sc,
             seed = jitterSeed,
+        )
+        Log.i(
+            TAG,
+            "stroke → px(${mapped.minOf { it.x }},${mapped.minOf { it.y }})..(" +
+                "${mapped.maxOf { it.x }},${mapped.maxOf { it.y }}), " +
+                "${dense.size} dense pts (page ${width}x$height)",
         )
         // No growFadeRegion: PEN-layer ink survives the fade by design.
         strokes.add(Planned(dense, Layer.PEN))
