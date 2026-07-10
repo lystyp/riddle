@@ -36,10 +36,10 @@ import kotlin.math.sqrt
  */
 object ReplyDsl {
 
-    // Safety caps quoted to the model in Oracle's system prompt and enforced
-    // here, so a runaway reply cannot queue minutes of animation.
-    const val MAX_STROKES = 20
-    const val MAX_POINTS = 600
+    // Silent backstops — never quoted to the model (it draws freely); they
+    // only stop a runaway reply from queueing minutes of animation.
+    const val MAX_STROKES = 64
+    const val MAX_POINTS = 2000
 
     /** A point in the snapshot's pixel space — what the model saw and meant. */
     data class ImgPt(val x: Float, val y: Float)

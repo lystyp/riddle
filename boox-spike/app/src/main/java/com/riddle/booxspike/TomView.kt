@@ -478,6 +478,32 @@ class TomView(context: Context) : View(context) {
     private var snapW = 1
     private var snapH = 1
 
+    // ≥0 while the send-time drink is dissolving the text layer; the reply
+    // fast-forwards it (finishDrink) so ink never lands on dissolving words.
+    private var drinkStage = -1
+
+    private val drinkTicker = object : Runnable {
+        override fun run() {
+            if (drinkStage < 0) return
+            dissolveRegionPass(textBmp, Rect(0, 0, width, height), drinkStage)
+            drinkStage++
+            if (drinkStage >= dissolveStages) finishDrink()
+            else ui.postDelayed(this, dissolveTickMs)
+        }
+    }
+
+    /** End the drink — naturally or in one gulp when the reply arrives. */
+    private fun finishDrink() {
+        if (drinkStage < 0) return
+        ui.removeCallbacks(drinkTicker)
+        drinkStage = -1
+        // The staged passes leave nothing by the last stage; the erase is
+        // the one-gulp path for a reply that outran the animation.
+        textBmp?.eraseColor(Color.TRANSPARENT)
+        Epd.partial(this, 0, 0, width, height, refreshMode)
+        status("the page is thinking…")
+    }
+
     private val commitCheck = Runnable {
         if (phase == Phase.IDLE && hasUserInk) commitPage()
     }
@@ -498,14 +524,13 @@ class TomView(context: Context) : View(context) {
         oracleActive = true
         turnWrote = false
         phase = Phase.THINKING
-        // The snapshot carries the words — the TEXT layer clears the moment
-        // the page is sent, so the reply lands on clean paper. Partial
-        // refresh, not GC: a flash on every send weighs more than the
-        // leftover ghosting, which the fade's full refresh clears anyway.
-        textBmp?.eraseColor(Color.TRANSPARENT)
         hasUserInk = false
-        Epd.partial(this, 0, 0, width, height, refreshMode)
-        status("the page is thinking…")
+        // The snapshot has the words now — the page drinks the WHOLE text
+        // layer while the request flies. Full-layer, no region bookkeeping:
+        // whatever is written there dissolves, unconditionally.
+        drinkStage = 0
+        ui.post(drinkTicker)
+        status("the page drinks your words…")
         o.ask(snap, object : Oracle.Listener {
             override fun onBlock(block: ReplyDsl.Block) {
                 post { onOracleBlock(block) }
@@ -659,6 +684,9 @@ class TomView(context: Context) : View(context) {
 
     /** A reply block arriving after the linger clears the stage first. */
     private fun prepareForNewInk() {
+        // Still drinking? Swallow the rest in one gulp — the reply must
+        // never ink over words that are mid-dissolve.
+        finishDrink()
         if (phase == Phase.LINGERING || phase == Phase.DISSOLVING) {
             ui.removeCallbacksAndMessages(null)
             resetPlan()
@@ -969,6 +997,7 @@ class TomView(context: Context) : View(context) {
         fadeRegion = null
         nextY = -1
         hasUserInk = false
+        drinkStage = -1 // a still-queued drinkTicker no-ops once negative
     }
 
     private fun growFadeRegion(x: Int, y: Int, margin: Int) {
