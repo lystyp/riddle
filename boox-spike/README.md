@@ -3,11 +3,30 @@
 一個最小 Android app，回答 riddle 移植 Boox 的唯一生死題：
 **Tom 逐筆回寫的手寫動畫，在 Boox 的 partial refresh 下夠不夠流暢？**
 
-這不是移植版 riddle——沒有筆輸入、沒有 oracle、沒有記憶。只有動畫引擎，
-但那條管線是真的：`script.rs` 的 Zhang-Suen 細線化 + stroke tracing 逐行移植成
-Kotlin（`Script.kt`），用同一個 DancingScript.ttf，動畫常數照抄 `main.rs`
+它從單純的動畫驗證長成了一個可以對話的頁面：筆輸入、oracle 迴圈、雙圖層
+都在，但動畫管線仍是真的：`script.rs` 的 Zhang-Suen 細線化 + stroke tracing
+逐行移植成 Kotlin（`Script.kt`），動畫常數照抄 `main.rs`
 （14ms tick / 26 點、筆徑 2、96px 行高 ×1.25、±3px 行抖動、寫完停 4s+2ms/點、
 10 段 × 80ms 溶解、結尾 GC 全刷）。你在 Boox 上看到的就是 Tom 真正的筆跡。
+
+## 雙圖層：畫布會留下，話語會消失
+
+頁面是兩層墨水疊起來的：
+
+- **畫筆圖層** — 共享畫布。你畫的圖和 oracle 的藍色筆畫都留在這層，
+  跨回合累積，永遠不會被清掉（除了 Clear）。
+- **文字圖層** — 對話。你寫給 oracle 的話住在這層，停筆 2.8s 後被頁面
+  「喝掉」；oracle 的文字回覆也寫在這層，讀完後自己溶解。
+
+每一回合筆都從**畫筆圖層**開始；用筆**快速點兩下**頁面切到文字圖層
+（再點兩下切回來），狀態列會顯示目前在哪一層。單獨點一下的墨點會延遲
+約 0.35s 才落墨——那是在等第二下。
+
+停筆後整頁（兩層合成）截圖送給 oracle。它以 100×100 的座標格看頁面、
+用純文字 DSL 回覆：`TEXT x y … END_TEXT` 是說話（寫進文字圖層，會溶解）、
+`STROKE / P x y / END_STROKE` 是畫畫（藍色墨水寫進畫筆圖層，留在紙上），
+兩種 block 邊串流邊逐筆寫出。文法與解析見 `ReplyDsl.kt`，prompt 在
+`Oracle.kt` 的 `SYSTEM_PROMPT`。
 
 ## 安裝
 
@@ -25,13 +44,16 @@ Kotlin（`Script.kt`），用同一個 DancingScript.ttf，動畫常數照抄 `m
 
 ## 操作
 
-| 按鈕 | 作用 |
+| 動作 | 作用 |
 |------|------|
-| **Write** | 逐筆寫出一段 Tom 的話（循環三段預設文字；寫完等待後自動溶解） |
+| 用筆寫、畫 | 上墨到目前圖層（預設畫筆圖層；停筆 2.8s 送 oracle） |
+| 筆快速點兩下 | 切換 畫筆圖層 ↔ 文字圖層 |
+| **Write** | 逐筆寫出一段預設文字（循環三段；寫完等待後自動溶解，測動畫用） |
 | **Mode** | 循環刷新波形：`DU` → `ANIM` → `GU` → `REGAL` → `PLAIN`（無 Onyx 呼叫的基準線） |
 | **Pace** | 循環節奏：`14ms×26`（riddle 原生）→ `33ms×62` → `66ms×124`（同樣墨水速率、較粗批次） |
-| **Clear** | 清頁 + GC 全刷 |
-| 點頁面 | 停留階段直接跳到溶解 |
+| **Pen** | 循環 SOFT → RAW·A/B/C（Onyx TouchHelper 硬體筆路徑實驗） |
+| **Clear** | 清兩層 + GC 全刷 |
+| 點頁面 | 停留階段直接跳到溶解（只有文字圖層消失） |
 
 狀態列會顯示每次寫入的統計（點數 / 耗時 / late tick 數）；詳細 log 在
 `adb logcat -s riddle-spike`（EpdController 呼叫失敗會記在這裡）。

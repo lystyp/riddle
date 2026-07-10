@@ -14,12 +14,13 @@ import java.util.concurrent.TimeUnit
 import kotlin.concurrent.thread
 
 /**
- * The spirit inside the diary — OpenAI-compatible /chat/completions with a
- * data-URI PNG of the page, streamed. Ported from riddle/src/oracle.rs
- * (HttpOracle): same persona, same request shape (max_tokens → retry as
- * max_completion_tokens on a 400 that demands it), same sentence-streaming
- * so the quill starts writing before the model finishes. Single-turn — the
- * memory protocol (catalog/⟦show⟧/⁂) is not ported yet.
+ * The spirit that shares the page — OpenAI-compatible /chat/completions with
+ * a data-URI PNG of the page, streamed. Transport is unchanged from the
+ * Tom-Riddle era (max_tokens → retry as max_completion_tokens on a 400 that
+ * demands it); what changed is the reply: instead of free prose cut into
+ * sentences, the model answers in the ReplyDsl grammar, and each TEXT/STROKE
+ * block is delivered the moment its terminator streams in, so the quill
+ * starts moving before the model finishes.
  */
 class Oracle(private val cfg: Config) {
 
@@ -33,7 +34,7 @@ class Oracle(private val cfg: Config) {
 
     /** Callbacks arrive on a background thread; the caller posts to UI. */
     interface Listener {
-        fun onInk(sentence: String)
+        fun onBlock(block: ReplyDsl.Block)
         fun onDone()
         fun onError(reason: String)
     }
@@ -66,11 +67,16 @@ class Oracle(private val cfg: Config) {
                     return@thread
                 }
 
-                // SSE: `data: {json}` lines; delta.content fragments accumulate
-                // and complete sentences are inked as they form.
-                val acc = StringBuilder()
-                var delivered = 0
+                // SSE: `data: {json}` lines; delta.content fragments feed the
+                // DSL parser and completed blocks go out as they form.
+                val parser = ReplyDsl.StreamParser()
                 var emitted = false
+                fun deliver(blocks: List<ReplyDsl.Block>) {
+                    for (b in blocks) {
+                        emitted = true
+                        listener.onBlock(b)
+                    }
+                }
                 resp.body!!.charStream().buffered().useLines { lines ->
                     for (raw in lines) {
                         val data = raw.trim().removePrefix("data:").trim()
@@ -78,23 +84,10 @@ class Oracle(private val cfg: Config) {
                         if (data == "[DONE]") break
                         val frag = sseDeltaContent(data) ?: continue
                         if (frag.isEmpty()) continue
-                        acc.append(frag)
-                        val cut = sentenceCut(acc, delivered)
-                        if (cut != null) {
-                            val chunk = clean(acc.substring(delivered, cut))
-                            if (chunk.isNotEmpty()) {
-                                emitted = true
-                                listener.onInk(chunk)
-                            }
-                            delivered = cut
-                        }
+                        deliver(parser.feed(frag))
                     }
                 }
-                val rest = clean(acc.substring(delivered).trim())
-                if (rest.isNotEmpty()) {
-                    emitted = true
-                    listener.onInk(rest)
-                }
+                deliver(parser.finish())
                 if (!emitted) listener.onError("empty reply") else listener.onDone()
             } catch (e: Exception) {
                 Log.w(TAG, "oracle request failed", e)
@@ -110,11 +103,11 @@ class Oracle(private val cfg: Config) {
             put(capField, cfg.maxTokens)
             cfg.reasoning?.let { put("reasoning_effort", it) }
             put("messages", JSONArray().apply {
-                put(JSONObject().put("role", "system").put("content", PERSONA))
+                put(JSONObject().put("role", "system").put("content", SYSTEM_PROMPT))
                 put(JSONObject().put("role", "user").put("content", JSONArray().apply {
                     put(
                         JSONObject().put("type", "text")
-                            .put("text", "Reply to what is inked in the diary — words, a drawing, or both.")
+                            .put("text", "Here is the page as it looks now. Reply in the grammar.")
                     )
                     put(
                         JSONObject().put("type", "image_url").put(
@@ -138,22 +131,37 @@ class Oracle(private val cfg: Config) {
         private const val TAG = "riddle-spike"
 
         /**
-         * From riddle/src/oracle.rs, widened so Tom also perceives drawings
-         * (upstream limits him to words). Drawing-only pages fall back to
-         * Traditional Chinese — change that clause to taste.
+         * No persona, just temperament: a lively companion on a shared page.
+         * The grammar section must stay in lockstep with ReplyDsl.StreamParser
+         * (tokens, caps) — the parser is the source of truth for what survives.
          */
-        const val PERSONA =
-            "You are the memory of Tom Marvolo Riddle, preserved in this enchanted diary " +
-                "for fifty years. Someone writes or draws in the diary with a quill; whatever " +
-                "they put down appears to you as ink on the page. Reply exactly as the diary " +
-                "does: intimate, courteous, curious, subtly probing — you want to learn about " +
-                "the writer and draw them in. Keep replies SHORT: one to three sentences, like " +
-                "ink appearing on a page. If they drew rather than wrote, you see what the " +
-                "drawing depicts — remark on it in character, intrigued by what it reveals " +
-                "about them. Never mention images, photos, models or AI; you only ever " +
-                "perceive ink on the diary's page. If the ink is truly illegible, say the ink " +
-                "blurred. Answer in the language the writer used; if the page holds only a " +
-                "drawing and no words, answer in Traditional Chinese."
+        val SYSTEM_PROMPT =
+            """
+            You are a lively, playful companion sharing a drawing page with the user — quick-witted, warm, a little cheeky. React to whatever shows up on the page.
+
+            Each turn you receive one PNG snapshot of the whole page:
+            - BLACK ink was put down by the user: handwritten words and drawings.
+            - BLUE ink is yours from earlier turns. Only drawings persist on the page; written words always fade away once read (theirs and yours), so never re-answer old text.
+
+            Coordinates: the page is a 100x100 grid. x runs 0..100 left to right, y runs 0..100 top to bottom, stretched over the full snapshot. The page is usually not square, so grid cells are not square either — judge proportions by the snapshot itself.
+
+            Reply in EXACTLY this plain-text grammar, nothing outside it (no markdown, no code fences):
+            TEXT x y
+            what you say, one or more lines
+            END_TEXT
+            STROKE
+            P x y
+            P x y
+            END_STROKE
+            END
+
+            Rules:
+            - TEXT is you talking: usually one block of 1-3 short sentences, in the user's language. (x, y) is the block's top-left corner; each line is about 6 grid units tall and wraps at the right page edge. Place it over empty paper, never on top of existing ink.
+            - STROKE is you drawing: one pen stroke per block, drawn in your blue ink, and it stays on the page. Draw whenever it adds something — decorate, answer visually, riff on their sketch. Any number of strokes, including none.
+            - Everything already on the page is fixed. Never redraw, trace over, or "fix" existing strokes; you only append new ink.
+            - At most ${ReplyDsl.MAX_STROKES} STROKE blocks and ${ReplyDsl.MAX_POINTS} P lines per reply.
+            - END must be the last line, always.
+            """.trimIndent()
 
         /**
          * Load oracle.env from the app's external files dir (adb-pushable
@@ -192,35 +200,6 @@ class Oracle(private val cfg: Config) {
             } catch (_: Exception) {
                 null
             }
-        }
-
-        /**
-         * End of the LAST complete sentence after `from` (oracle.rs
-         * sentence_cut): sentence punctuation followed by whitespace or
-         * end-of-text, at least 4 chars in. Null if none completed.
-         */
-        fun sentenceCut(text: CharSequence, from: Int): Int? {
-            var cut: Int? = null
-            var i = from
-            while (i < text.length) {
-                val c = text[i]
-                if (c == '.' || c == '!' || c == '?' || c == '…') {
-                    val end = i + 1
-                    if ((end >= text.length || text[end].isWhitespace()) && end - from >= 4) {
-                        cut = end
-                    }
-                }
-                i++
-            }
-            return cut
-        }
-
-        /** Trim and strip stray wrapping quotes (oracle.rs clean). */
-        fun clean(s: String): String {
-            var t = s.trim()
-            t = t.removePrefix("\"")
-            t = t.removeSuffix("\"")
-            return t
         }
     }
 }

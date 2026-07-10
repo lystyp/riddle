@@ -46,7 +46,7 @@ class MainActivity : Activity() {
             setBackgroundColor(Color.WHITE)
             setPadding(16, 4, 16, 4)
             text = if (cfg != null) {
-                "oracle ready (${cfg.model}) — write to Tom with the pen, rest it, and wait"
+                "oracle ready (${cfg.model}) — 畫筆層作畫、雙擊筆切文字層寫話，停筆等回應"
             } else {
                 "oracle 未設定：adb push oracle.env " +
                     "${getExternalFilesDir(null)?.absolutePath}/oracle.env"

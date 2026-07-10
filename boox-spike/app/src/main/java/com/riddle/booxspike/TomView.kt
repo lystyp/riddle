@@ -15,17 +15,28 @@ import android.view.MotionEvent
 import android.view.View
 import java.nio.ByteBuffer
 import kotlin.math.ceil
+import kotlin.math.hypot
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
 
 /**
- * The page. Mirrors riddle's Replying → Lingering → FadingReply states with
- * the same constants (main.rs): 14ms tick / 26 points per tick, nib radius 2,
- * REPLY_PX 96, line height ×1.25, ±3px per-line wobble (same LCG), linger
- * 4s + 2ms·points (cap 20s, tap to skip), dissolve 10 stages × 80ms, full
- * GC refresh at the end. All lengths scale by (view width / 1620) so
- * proportions match the Paper Pro reference device.
+ * The page, as two stacked layers of ink:
+ *
+ * - PEN layer — the shared canvas. The user's drawings and the oracle's blue
+ *   strokes accumulate here across turns; nothing on it ever fades.
+ * - TEXT layer — the conversation. The user's written words live here until
+ *   the page drinks them at commit; the oracle's spoken reply is written here
+ *   and dissolves after the linger.
+ *
+ * The pen starts each turn on the PEN layer; a quick double-tap of the pen
+ * toggles which layer new ink lands on. Everything else mirrors riddle's
+ * Replying → Lingering → FadingReply states with the same constants
+ * (main.rs): 14ms tick / 26 points per tick, nib radius 2, REPLY_PX 96, line
+ * height ×1.25, ±3px per-line wobble (same LCG), linger 4s + 2ms·points
+ * (cap 20s, tap to skip), dissolve 10 stages × 80ms, full GC refresh at the
+ * end. All lengths scale by (view width / 1620) so proportions match the
+ * Paper Pro reference device.
  */
 class TomView(context: Context) : View(context) {
 
@@ -36,6 +47,12 @@ class TomView(context: Context) : View(context) {
     private val nibRRef = 2f
     private val dissolveStages = 10
     private val dissolveTickMs = 80L
+
+    // ---- pen-tap gesture tuning ----
+    private val tapMaxMs = 220L      // press longer than this and it's a dot, not a tap
+    private val doubleTapMs = 350L   // max gap between tap-up and the second tap-up
+    private val tapSlopPx: Float get() = 12f * sc
+    private val doubleTapSlopPx: Float get() = 80f * sc
 
     /** Pace preset, settable from the UI. riddle's own pace is 14ms/26pts. */
     var tickMs = 14L
@@ -51,18 +68,34 @@ class TomView(context: Context) : View(context) {
     /** Set when the RAW pen path is toggled on; paused while the page animates. */
     var rawPen: RawPen? = null
 
-    /** The spirit in the diary; null until oracle.env is configured. */
+    /** The spirit on the page; null until oracle.env is configured. */
     var oracle: Oracle? = null
 
     private val ui = Handler(Looper.getMainLooper())
-    private var bmp: Bitmap? = null
-    private var page: Canvas? = null
+
+    enum class Layer { PEN, TEXT }
+
+    private var penBmp: Bitmap? = null
+    private var penPage: Canvas? = null
+    private var textBmp: Bitmap? = null
+    private var textPage: Canvas? = null
+    private var activeLayer = Layer.PEN
+
     // Tom's hand: Caveat (flowing but legible, Latin-only). Assets also carry
     // LXGWWenKaiTC (handwritten 楷體 with Traditional Chinese), DancingScript,
     // and PatrickHand — swap the filename here.
     private val face: Typeface = Typeface.createFromAsset(context.assets, "Caveat.ttf")
     private val inkPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = Color.BLACK
+        style = Paint.Style.STROKE
+        strokeCap = Paint.Cap.ROUND
+        strokeJoin = Paint.Join.ROUND
+    }
+
+    // The oracle's ink — a color the user's black never is, quoted to the
+    // model in Oracle.SYSTEM_PROMPT so it can tell its own strokes apart.
+    private val aiPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.rgb(30, 90, 200)
         style = Paint.Style.STROKE
         strokeCap = Paint.Cap.ROUND
         strokeJoin = Paint.Join.ROUND
@@ -75,10 +108,12 @@ class TomView(context: Context) : View(context) {
     private var phase = Phase.IDLE
 
     // ---- write plan (plan_reply / WritePlan) ----
-    private val strokes = ArrayList<List<Script.Pt>>()
+    private class Planned(val pts: List<Script.Pt>, val layer: Layer)
+
+    private val strokes = ArrayList<Planned>()
     private var strokeI = 0
     private var pointI = 0
-    private var region: Rect? = null
+    private var fadeRegion: Rect? = null
     private var nextY = -1
     private var jitterSeed = 0x1234
 
@@ -98,16 +133,27 @@ class TomView(context: Context) : View(context) {
         ui.removeCallbacksAndMessages(null)
         phase = Phase.IDLE
         resetPlan()
-        bmp?.recycle()
-        bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888).also {
-            it.eraseColor(Color.WHITE)
-            page = Canvas(it)
+        activeLayer = Layer.PEN
+        penBmp?.recycle()
+        penBmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888).also {
+            it.eraseColor(Color.TRANSPARENT)
+            penPage = Canvas(it)
+        }
+        textBmp?.recycle()
+        textBmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888).also {
+            it.eraseColor(Color.TRANSPARENT)
+            textPage = Canvas(it)
         }
     }
 
     override fun onDraw(canvas: Canvas) {
-        bmp?.let { canvas.drawBitmap(it, 0f, 0f, null) }
+        // White paper, the lasting pen layer, the fleeting text layer on top.
+        penBmp?.let { canvas.drawBitmap(it, 0f, 0f, null) }
+        textBmp?.let { canvas.drawBitmap(it, 0f, 0f, null) }
     }
+
+    private fun pageFor(layer: Layer): Canvas? =
+        if (layer == Layer.PEN) penPage else textPage
 
     // ---- user ink (pen.rs → ink.rs pen_point, via MotionEvent) ----
 
@@ -119,6 +165,20 @@ class TomView(context: Context) : View(context) {
     private var pMax = 0f
     private var strokeTool = "?"
 
+    // A fresh pen-down is held back as a tap candidate until it moves or
+    // lingers: a quick tap must leave no ink (it may be half of a
+    // layer-toggle double-tap), so the dot is only committed after
+    // doubleTapMs passes with no second tap.
+    private var tapCandidate = false
+    private var downX = 0f
+    private var downY = 0f
+    private var downMs = 0L
+    private val tapSamples = ArrayList<FloatArray>() // x, y, pressure
+    private var pendingTap: FloatArray? = null
+    private var pendingTapSamples: List<FloatArray> = emptyList()
+    private var pendingTapUpMs = 0L
+    private val pendingTapCommit = Runnable { commitPendingTap() }
+
     @SuppressLint("ClickableViewAccessibility")
     override fun onTouchEvent(event: MotionEvent): Boolean {
         when (event.actionMasked) {
@@ -126,6 +186,8 @@ class TomView(context: Context) : View(context) {
                 // A second finger landed: chrome-restore gesture, not ink.
                 if (event.pointerCount >= 2) {
                     inking = false
+                    tapCandidate = false
+                    tapSamples.clear()
                     onChromeRestore?.invoke()
                     return true
                 }
@@ -143,6 +205,7 @@ class TomView(context: Context) : View(context) {
                     event.getToolType(0) == MotionEvent.TOOL_TYPE_STYLUS
                 ) return true
                 ui.removeCallbacks(commitCheck)
+                ui.removeCallbacks(pendingTapCommit)
                 inking = true
                 strokePts = 0
                 pMin = 1f
@@ -152,13 +215,33 @@ class TomView(context: Context) : View(context) {
                     MotionEvent.TOOL_TYPE_FINGER -> "finger"
                     else -> "tool${event.getToolType(0)}"
                 }
-                lastX = event.x
-                lastY = event.y
-                inkSegment(event.x, event.y, event.pressure, first = true)
-                flushInk()
+                downX = event.x
+                downY = event.y
+                downMs = SystemClock.uptimeMillis()
+                tapCandidate = true
+                tapSamples.clear()
+                tapSamples.add(floatArrayOf(event.x, event.y, event.pressure))
             }
             MotionEvent.ACTION_MOVE -> {
                 if (!inking) return true
+                if (tapCandidate) {
+                    for (h in 0 until event.historySize) {
+                        tapSamples.add(
+                            floatArrayOf(
+                                event.getHistoricalX(h),
+                                event.getHistoricalY(h),
+                                event.getHistoricalPressure(h),
+                            )
+                        )
+                    }
+                    tapSamples.add(floatArrayOf(event.x, event.y, event.pressure))
+                    if (hypot(event.x - downX, event.y - downY) > tapSlopPx ||
+                        SystemClock.uptimeMillis() - downMs > tapMaxMs
+                    ) {
+                        spillTapAsStroke()
+                    }
+                    return true
+                }
                 // Drain the batched history: the pen samples at ~442Hz, far
                 // above the frame-rate MotionEvent delivery. Draw every
                 // sample, refresh once per batch (riddle's per-frame model).
@@ -176,8 +259,21 @@ class TomView(context: Context) : View(context) {
             MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
                 if (inking) {
                     inking = false
+                    if (tapCandidate) {
+                        tapCandidate = false
+                        if (SystemClock.uptimeMillis() - downMs <= tapMaxMs) {
+                            onPenTap(downX, downY)
+                        } else {
+                            // A long, motionless press: a deliberate dot.
+                            replayAsInk(tapSamples)
+                            tapSamples.clear()
+                            scheduleCommit()
+                        }
+                        return true
+                    }
                     status(
-                        "$strokeTool stroke: $strokePts pts, pressure %.2f–%.2f — mode=${refreshMode.label}"
+                        ("$strokeTool stroke: $strokePts pts, pressure %.2f–%.2f — " +
+                            "層=${layerLabel()} mode=${refreshMode.label}")
                             .format(pMin, pMax)
                     )
                     scheduleCommit()
@@ -187,6 +283,79 @@ class TomView(context: Context) : View(context) {
         return true
     }
 
+    /** The tap candidate moved or lingered — it is ordinary ink after all. */
+    private fun spillTapAsStroke() {
+        tapCandidate = false
+        // If a lone dot was still waiting on the double-tap window, the
+        // writer has moved on to real writing: that dot was real ink too.
+        if (pendingTap != null) commitPendingTap()
+        replayAsInk(tapSamples)
+        tapSamples.clear()
+    }
+
+    /** Buffered pen samples become ink on the active layer, in one pass. */
+    private fun replayAsInk(samples: List<FloatArray>) {
+        var first = true
+        for (s in samples) {
+            if (first) {
+                lastX = s[0]
+                lastY = s[1]
+            }
+            inkSegment(s[0], s[1], s[2], first)
+            first = false
+        }
+        flushInk()
+    }
+
+    private fun onPenTap(x: Float, y: Float) {
+        val now = SystemClock.uptimeMillis()
+        val prev = pendingTap
+        if (prev != null && now - pendingTapUpMs <= doubleTapMs &&
+            hypot(x - prev[0], y - prev[1]) <= doubleTapSlopPx
+        ) {
+            // Second tap in time and in place: toggle, both dots vanish.
+            pendingTap = null
+            pendingTapSamples = emptyList()
+            toggleLayer()
+            // The raw path's firmware preview may have left ghost dots.
+            refreshAround(prev[0], prev[1])
+            refreshAround(x, y)
+            if (hasUserInk) scheduleCommit()
+            return
+        }
+        // A lone tap far from the previous one: that previous dot was ink.
+        if (prev != null) commitPendingTap()
+        pendingTap = floatArrayOf(x, y)
+        pendingTapSamples = ArrayList(tapSamples)
+        pendingTapUpMs = now
+        ui.postDelayed(pendingTapCommit, doubleTapMs)
+    }
+
+    /** No second tap arrived — the held-back dot becomes real ink. */
+    private fun commitPendingTap() {
+        if (pendingTap == null) return
+        pendingTap = null
+        ui.removeCallbacks(pendingTapCommit)
+        replayAsInk(pendingTapSamples)
+        pendingTapSamples = emptyList()
+        scheduleCommit()
+    }
+
+    private fun toggleLayer() {
+        activeLayer = if (activeLayer == Layer.PEN) Layer.TEXT else Layer.PEN
+        status(
+            if (activeLayer == Layer.TEXT) "圖層：文字 — 這層的字會被頁面喝掉"
+            else "圖層：畫筆 — 這層的墨水留在紙上"
+        )
+    }
+
+    private fun layerLabel() = if (activeLayer == Layer.PEN) "畫筆" else "文字"
+
+    private fun refreshAround(x: Float, y: Float) {
+        val r = (30 * sc).toInt()
+        Epd.partial(this, x.toInt() - r, y.toInt() - r, x.toInt() + r, y.toInt() + r, refreshMode)
+    }
+
     private var inkDirtyL = Int.MAX_VALUE
     private var inkDirtyT = Int.MAX_VALUE
     private var inkDirtyR = Int.MIN_VALUE
@@ -194,7 +363,7 @@ class TomView(context: Context) : View(context) {
 
     /** One ink segment; nib radius follows pressure like riddle's brush. */
     private fun inkSegment(x: Float, y: Float, pressure: Float, first: Boolean) {
-        val pg = page ?: return
+        val pg = pageFor(activeLayer) ?: return
         val p = pressure.coerceIn(0f, 1f)
         pMin = min(pMin, p)
         pMax = max(pMax, p)
@@ -212,30 +381,34 @@ class TomView(context: Context) : View(context) {
         inkDirtyT = min(inkDirtyT, min(lastY, y).toInt() - margin)
         inkDirtyR = max(inkDirtyR, max(lastX, x).toInt() + margin)
         inkDirtyB = max(inkDirtyB, max(lastY, y).toInt() + margin)
-        // inkSegment only ever draws the writer's ink — track it for commit.
+        // inkSegment only ever draws the writer's ink — track it for commit;
+        // only the TEXT layer's share is drunk when the page commits.
         hasUserInk = true
-        val u = userInkRegion ?: Rect(x.toInt(), y.toInt(), x.toInt(), y.toInt())
-            .also { userInkRegion = it }
-        u.union(x.toInt() - margin, y.toInt() - margin)
-        u.union(x.toInt() + margin, y.toInt() + margin)
+        if (activeLayer == Layer.TEXT) {
+            val u = userTextRegion ?: Rect(x.toInt(), y.toInt(), x.toInt(), y.toInt())
+                .also { userTextRegion = it }
+            u.union(x.toInt() - margin, y.toInt() - margin)
+            u.union(x.toInt() + margin, y.toInt() + margin)
+        }
         lastX = x
         lastY = y
         strokePts++
     }
 
     // ---- hybrid raw-mode live rendering ----
-    // Move-callback points stream in from the SDK thread; the UI thread
-    // drains them every 33ms and inks pressure-width segments while the
-    // hardware preview supplies the instant fixed-width feedback on top.
+    // Move-callback points stream in from the SDK thread and are buffered
+    // only; everything is inked in one pass at pen-up while the hardware
+    // preview supplies the instant fixed-width feedback on top.
 
     private val liveQueue = java.util.concurrent.ConcurrentLinkedQueue<FloatArray>()
-    private var liveFirst = true
     private var strokeWide: Rect? = null
+    private var rawBeginMs = 0L
 
     fun beginRawLiveStroke() {
         ui.removeCallbacks(commitCheck)
+        ui.removeCallbacks(pendingTapCommit)
         liveQueue.clear()
-        liveFirst = true
+        rawBeginMs = SystemClock.uptimeMillis()
         strokeWide = null
         strokePts = 0
         pMin = 1f
@@ -253,20 +426,24 @@ class TomView(context: Context) : View(context) {
         liveQueue.add(floatArrayOf(x, y, pressure))
     }
 
-    private val liveDrain = Runnable {
-        var item = liveQueue.poll() ?: return@Runnable
-        while (true) {
-            // TouchPoint pressure may arrive raw (0..4096) or normalized.
-            val pr = if (item[2] > 1.5f) item[2] / 4096f else item[2]
-            inkSegment(item[0], item[1], pr, liveFirst)
-            liveFirst = false
-            item = liveQueue.poll() ?: break
-        }
-        flushInk()
-    }
-
     fun finishRawLiveStroke() {
-        liveDrain.run()
+        val samples = ArrayList<FloatArray>()
+        while (true) samples.add(liveQueue.poll() ?: break)
+        // TouchPoint pressure may arrive raw (0..4096) or normalized.
+        for (s in samples) if (s[2] > 1.5f) s[2] = s[2] / 4096f
+        if (samples.isEmpty()) return
+        // The same tap-vs-ink split as the soft path, judged at pen-up
+        // (raw points only surface here, so the decision cannot be earlier).
+        val duration = SystemClock.uptimeMillis() - rawBeginMs
+        val first = samples.first()
+        val moved = samples.maxOf { hypot(it[0] - first[0], it[1] - first[1]) }
+        if (duration <= tapMaxMs && moved <= tapSlopPx) {
+            tapSamples.clear()
+            tapSamples.addAll(samples)
+            onPenTap(first[0], first[1])
+            return
+        }
+        replayAsInk(samples)
         // The refresh suppression holds for as long as raw drawing is
         // enabled — the EinkDraw handoff: drop raw for a beat so the
         // hardware preview vanishes and the real pressure-width ink lands
@@ -277,22 +454,23 @@ class TomView(context: Context) : View(context) {
         strokeWide = null
         if (raw?.engaged == true) ui.postDelayed({ raw.setPaused(false) }, 80)
         if (strokePts > 0) {
-            status("raw hybrid stroke: $strokePts pts, pressure %.2f–%.2f".format(pMin, pMax))
+            status("raw hybrid stroke: $strokePts pts, pressure %.2f–%.2f — 層=${layerLabel()}".format(pMin, pMax))
             scheduleCommit()
         }
     }
 
     // ---- the oracle turn: idle commit → drink → think → streamed reply ----
     // Mirrors main.rs: IDLE_COMMIT 2.8s after pen-up, dissolve the writer's
-    // ink while the request flies, buffer sentences until the page is clean,
-    // then ink them with the existing write animation; the ticker hovers
-    // while the stream is still open (rx.is_some()).
+    // TEXT-layer ink while the request flies, buffer reply blocks until the
+    // drink finishes, then ink them with the write animation; the ticker
+    // hovers while the stream is still open (rx.is_some()).
 
-    private var userInkRegion: Rect? = null
+    private var userTextRegion: Rect? = null
     private var hasUserInk = false
     private var oracleActive = false
     private var turnWrote = false
-    private val pendingSentences = ArrayDeque<String>()
+    private val pendingBlocks = ArrayDeque<ReplyDsl.Block>()
+    private var pendingExcuse: String? = null
     private var drinkStage = 0
     private var drinkRegion: Rect? = null
 
@@ -311,20 +489,21 @@ class TomView(context: Context) : View(context) {
             status("oracle 未設定 — push oracle.env（見 README）; ink stays")
             return
         }
-        val region = userInkRegion ?: return
-        val png = capturePagePng(region) ?: return
+        val png = capturePagePng() ?: return
         rawPen?.setPaused(true)
         oracleActive = true
         turnWrote = false
-        pendingSentences.clear()
+        pendingBlocks.clear()
+        pendingExcuse = null
         phase = Phase.DRINKING
-        drinkRegion = Rect(region)
+        // Only the words are drunk; the PEN layer is the shared canvas.
+        drinkRegion = userTextRegion?.let { Rect(it) }
         drinkStage = 0
-        status("the diary drinks your ink…")
+        status("the page drinks your words…")
         ui.post(drinkTicker)
         o.ask(png, object : Oracle.Listener {
-            override fun onInk(sentence: String) {
-                post { onOracleInk(sentence) }
+            override fun onBlock(block: ReplyDsl.Block) {
+                post { onOracleBlock(block) }
             }
 
             override fun onDone() {
@@ -337,21 +516,30 @@ class TomView(context: Context) : View(context) {
         })
     }
 
-    /** ink.rs to_png: crop to the ink bbox + 20px, downscale ≥2x to ≤800px. */
-    private fun capturePagePng(region: Rect): ByteArray? {
-        val b = bmp ?: return null
-        val r = Rect(region)
-        r.inset(-20, -20)
-        if (!r.intersect(0, 0, width, height) || r.isEmpty) return null
-        val f = max(2, (max(r.width(), r.height()) + 799) / 800)
-        val crop = Bitmap.createBitmap(b, r.left, r.top, r.width(), r.height())
-        val scaled = Bitmap.createScaledBitmap(
-            crop, max(1, r.width() / f), max(1, r.height() / f), true
-        )
+    /**
+     * The whole page, both layers over white, downscaled to ≤800px on the
+     * long side. Full-page (not cropped to the ink) because the model's
+     * 100×100 reply grid spans the full page — a crop would shear the
+     * mapping between what it sees and where it draws.
+     */
+    private fun capturePagePng(): ByteArray? {
+        val pen = penBmp ?: return null
+        val text = textBmp ?: return null
+        if (width <= 0 || height <= 0) return null
+        val f = max(2, (max(width, height) + 799) / 800)
+        val w = max(1, width / f)
+        val h = max(1, height / f)
+        val snap = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+        val c = Canvas(snap)
+        c.drawColor(Color.WHITE)
+        val filter = Paint(Paint.FILTER_BITMAP_FLAG)
+        val src = Rect(0, 0, width, height)
+        val dst = Rect(0, 0, w, h)
+        c.drawBitmap(pen, src, dst, filter)
+        c.drawBitmap(text, src, dst, filter)
         val out = java.io.ByteArrayOutputStream()
-        scaled.compress(Bitmap.CompressFormat.PNG, 100, out)
-        if (scaled !== crop) scaled.recycle()
-        crop.recycle()
+        snap.compress(Bitmap.CompressFormat.PNG, 100, out)
+        snap.recycle()
         return out.toByteArray()
     }
 
@@ -359,7 +547,7 @@ class TomView(context: Context) : View(context) {
         override fun run() {
             if (phase != Phase.DRINKING) return
             val reg = drinkRegion ?: run { finishDrink(); return }
-            dissolveRegionPass(reg, drinkStage)
+            dissolveRegionPass(textBmp, reg, drinkStage)
             drinkStage++
             if (drinkStage >= dissolveStages) finishDrink() else ui.postDelayed(this, dissolveTickMs)
         }
@@ -367,26 +555,31 @@ class TomView(context: Context) : View(context) {
 
     private fun finishDrink() {
         drinkRegion = null
-        userInkRegion = null
+        userTextRegion = null
         hasUserInk = false
         phase = Phase.THINKING
-        if (pendingSentences.isEmpty()) status("the diary is thinking…")
-        while (pendingSentences.isNotEmpty()) {
+        if (pendingBlocks.isEmpty() && pendingExcuse == null) status("the page is thinking…")
+        while (pendingBlocks.isNotEmpty()) {
             turnWrote = true
-            write(pendingSentences.removeFirst())
+            ink(pendingBlocks.removeFirst())
+        }
+        pendingExcuse?.let {
+            pendingExcuse = null
+            turnWrote = true
+            write(it)
         }
         if (!oracleActive && !turnWrote) {
             writeExcuse("empty reply")
         }
     }
 
-    private fun onOracleInk(sentence: String) {
+    private fun onOracleBlock(block: ReplyDsl.Block) {
         if (!oracleActive) return
         if (phase == Phase.DRINKING) {
-            pendingSentences.add(sentence)
+            pendingBlocks.add(block)
         } else {
             turnWrote = true
-            write(sentence)
+            ink(block)
         }
     }
 
@@ -399,7 +592,7 @@ class TomView(context: Context) : View(context) {
         android.util.Log.w("riddle-spike", "oracle error: $reason")
         oracleActive = false
         if (phase == Phase.DRINKING) {
-            pendingSentences.add(excuseFor(reason))
+            pendingExcuse = excuseFor(reason)
             turnWrote = true // the excuse counts as the reply
         } else {
             writeExcuse(reason)
@@ -411,7 +604,7 @@ class TomView(context: Context) : View(context) {
         write(excuseFor(reason))
     }
 
-    /** Simplified from main.rs oracle_excuse: stay in character, keep the clue. */
+    /** Stay on the page, keep the clue. */
     private fun excuseFor(reason: String): String =
         "The ink blurs and will not settle… (${reason.take(80)})"
 
@@ -430,27 +623,46 @@ class TomView(context: Context) : View(context) {
         inkDirtyB = Int.MIN_VALUE
     }
 
+    // ---- planning the oracle's ink ----
+
+    /** Plan one streamed reply block and make sure the quill is moving. */
+    private fun ink(block: ReplyDsl.Block) {
+        prepareForNewInk()
+        when (block) {
+            is ReplyDsl.Text -> planText(block)
+            is ReplyDsl.Stroke -> planStroke(block)
+        }
+        startWriting()
+    }
+
     /**
-     * Ink `text` onto the page. Pressed while writing, it appends like a
-     * streamed oracle chunk (append_reply); pressed while idle it continues
-     * below the previous reply, clearing first when the page would overflow.
+     * Ink `text` onto the page with no grid position (excuses, the Write
+     * button): the legacy centered flow — below the previous reply, clearing
+     * the text layer first when the page would overflow.
      */
     fun write(text: String) {
-        val pg = page ?: return
-        if (phase == Phase.LINGERING || phase == Phase.DISSOLVING) {
-            ui.removeCallbacksAndMessages(null)
-            resetPlan()
-            pg.drawColor(Color.WHITE)
-            Epd.fullRefresh(this)
-            phase = Phase.IDLE
-        }
+        prepareForNewInk()
         val lineH = (replyPxRef * sc * lineHFactor).toInt()
         if (nextY >= 0 && nextY + 2 * lineH > height) {
             resetPlan()
-            pg.drawColor(Color.WHITE)
-            Epd.fullRefresh(this)
+            clearTextLayer()
         }
         planReply(text)
+        startWriting()
+        status("writing… mode=${refreshMode.label} pace=${tickMs}ms×${budget()}")
+    }
+
+    /** A reply block arriving after the linger clears the stage first. */
+    private fun prepareForNewInk() {
+        if (phase == Phase.LINGERING || phase == Phase.DISSOLVING) {
+            ui.removeCallbacksAndMessages(null)
+            resetPlan()
+            clearTextLayer()
+            phase = Phase.IDLE
+        }
+    }
+
+    private fun startWriting() {
         if (phase != Phase.WRITING) {
             rawPen?.setPaused(true)
             phase = Phase.WRITING
@@ -459,14 +671,20 @@ class TomView(context: Context) : View(context) {
             lateTicks = 0
             ui.post(ticker)
         }
-        status("writing… mode=${refreshMode.label} pace=${tickMs}ms×${budget()}")
+    }
+
+    private fun clearTextLayer() {
+        textBmp?.eraseColor(Color.TRANSPARENT)
+        Epd.fullRefresh(this)
     }
 
     fun clearPage() {
         ui.removeCallbacksAndMessages(null)
         phase = Phase.IDLE
         resetPlan()
-        page?.drawColor(Color.WHITE)
+        activeLayer = Layer.PEN
+        penBmp?.eraseColor(Color.TRANSPARENT)
+        textBmp?.eraseColor(Color.TRANSPARENT)
         Epd.fullRefresh(this)
         rawPen?.setPaused(false)
         status("cleared — mode=${refreshMode.label} pace=${tickMs}ms×${budget()}")
@@ -474,30 +692,70 @@ class TomView(context: Context) : View(context) {
 
     // ---- plan_reply, same layout math ----
 
+    private fun replyPaint() = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        typeface = face
+        textSize = replyPxRef * sc
+    }
+
+    /** Legacy flow layout: centered lines from nextY (excuses / Write button). */
     private fun planReply(text: String) {
-        val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            typeface = face
-            textSize = replyPxRef * sc
-        }
+        val paint = replyPaint()
         val maxW = width - 2 * marginXRef * sc
         val lines = wrap(paint, text, maxW)
         val lineH = (replyPxRef * sc * lineHFactor).toInt()
         val totalH = lineH * lines.size
         var y = if (nextY >= 0) nextY else max((height - totalH) / 3, (60 * sc).toInt())
         for (lineText in lines) {
-            val m = rasterize(paint, lineText)
-            Script.thin(m.mask, m.w, m.h)
-            val lineStrokes = Script.trace(m.mask, m.w, m.h)
-            val x0 = (width - m.w) / 2
-            val wobble = jitter()
-            for (s in lineStrokes) {
-                val mapped = s.map { Script.Pt(x0 + it.x, y + it.y + wobble) }
-                for (p in mapped) growRegion(p.x, p.y, (5 * sc).roundToInt())
-                strokes.add(mapped)
-            }
+            planTextLine(paint, lineText, null, y)
             y += lineH
         }
         nextY = y
+    }
+
+    /** A TEXT block: left-aligned at its grid position, wrapping to the margin. */
+    private fun planText(block: ReplyDsl.Text) {
+        val paint = replyPaint()
+        val lineH = (replyPxRef * sc * lineHFactor).toInt()
+        // Clamp so the block keeps at least a quarter page to wrap into and
+        // never starts below the last full line.
+        val x0 = (block.x / ReplyDsl.GRID * width)
+            .coerceIn(0f, max(0f, width * 0.75f))
+            .toInt()
+        val maxW = width - x0 - marginXRef * sc
+        val lines = wrap(paint, block.text, maxW)
+        var y = (block.y / ReplyDsl.GRID * height).toInt()
+            .coerceIn(0, max(0, height - lineH * lines.size))
+        for (lineText in lines) {
+            planTextLine(paint, lineText, x0, y)
+            y += lineH
+        }
+    }
+
+    /** Rasterize → thin → trace one line into TEXT-layer quill strokes. */
+    private fun planTextLine(paint: Paint, lineText: String, xLeft: Int?, y: Int) {
+        val m = rasterize(paint, lineText)
+        Script.thin(m.mask, m.w, m.h)
+        val lineStrokes = Script.trace(m.mask, m.w, m.h)
+        val x0 = xLeft ?: (width - m.w) / 2
+        val wobble = jitter()
+        for (s in lineStrokes) {
+            val mapped = s.map { Script.Pt(x0 + it.x, y + it.y + wobble) }
+            for (p in mapped) growFadeRegion(p.x, p.y, (5 * sc).roundToInt())
+            strokes.add(Planned(mapped, Layer.TEXT))
+        }
+    }
+
+    /** A STROKE block: grid polyline → page pixels → hand-paced dense path. */
+    private fun planStroke(block: ReplyDsl.Stroke) {
+        jitter() // advance the shared LCG so each stroke wobbles differently
+        val dense = ReplyDsl.densify(
+            ReplyDsl.mapToCanvas(block.points, width, height),
+            spacingPx = max(1, (2 * sc).roundToInt()),
+            wobblePx = 1.5f * sc,
+            seed = jitterSeed,
+        )
+        // No growFadeRegion: PEN-layer ink survives the fade by design.
+        strokes.add(Planned(dense, Layer.PEN))
     }
 
     private fun jitter(): Int {
@@ -568,7 +826,6 @@ class TomView(context: Context) : View(context) {
     private val ticker = object : Runnable {
         override fun run() {
             if (phase != Phase.WRITING) return
-            val pg = page ?: return
             val t0 = SystemClock.uptimeMillis()
             var budget = budget()
             val margin = max(4, (4 * sc).roundToInt())
@@ -581,21 +838,22 @@ class TomView(context: Context) : View(context) {
                 dr = max(dr, x + margin); db = max(db, y + margin)
             }
             val r = nibRRef * sc
-            inkPaint.strokeWidth = 2 * r + 1
+            aiPaint.strokeWidth = 2 * r + 1
             while (budget > 0 && strokeI < strokes.size) {
                 val st = strokes[strokeI]
-                if (pointI >= st.size) {
+                val pg = pageFor(st.layer)
+                if (pg == null || pointI >= st.pts.size) {
                     strokeI++
                     pointI = 0
                     continue
                 }
-                val p = st[pointI]
+                val p = st.pts[pointI]
                 if (pointI > 0) {
-                    val q = st[pointI - 1]
-                    pg.drawLine(q.x.toFloat(), q.y.toFloat(), p.x.toFloat(), p.y.toFloat(), inkPaint)
+                    val q = st.pts[pointI - 1]
+                    pg.drawLine(q.x.toFloat(), q.y.toFloat(), p.x.toFloat(), p.y.toFloat(), aiPaint)
                     dirty(q.x, q.y)
                 } else {
-                    pg.drawPoint(p.x.toFloat(), p.y.toFloat(), inkPaint)
+                    pg.drawPoint(p.x.toFloat(), p.y.toFloat(), aiPaint)
                 }
                 dirty(p.x, p.y)
                 pointI++
@@ -612,7 +870,7 @@ class TomView(context: Context) : View(context) {
                     return
                 }
                 phase = Phase.LINGERING
-                val pts = strokes.sumOf { it.size }
+                val pts = strokes.sumOf { it.pts.size }
                 val elapsed = SystemClock.uptimeMillis() - writeStartMs
                 val linger = min(4000L + 2L * pts, 20_000L)
                 status(
@@ -627,6 +885,8 @@ class TomView(context: Context) : View(context) {
     }
 
     // ---- FadingReply (main.rs) + dissolve_pass (ink.rs) ----
+    // Only the TEXT layer ever dissolves: the drink eats the writer's words,
+    // the fade eats the reply. PEN-layer ink is never touched.
 
     private val startDissolve = Runnable {
         if (phase == Phase.LINGERING) {
@@ -639,15 +899,15 @@ class TomView(context: Context) : View(context) {
     private val dissolveTicker = object : Runnable {
         override fun run() {
             if (phase != Phase.DISSOLVING) return
-            val reg = region ?: run { finishFade(); return }
-            dissolveRegionPass(reg, dissolveStage)
+            val reg = fadeRegion ?: run { finishFade(); return }
+            dissolveRegionPass(textBmp, reg, dissolveStage)
             dissolveStage++
             if (dissolveStage >= dissolveStages) finishFade() else ui.postDelayed(this, dissolveTickMs)
         }
     }
 
     /** One dissolve_pass (ink.rs): erase this stage's hashed pixels in `regIn`. */
-    private fun dissolveRegionPass(regIn: Rect, stage: Int) {
+    private fun dissolveRegionPass(bmp: Bitmap?, regIn: Rect, stage: Int) {
         val b = bmp ?: return
         val r = Rect(regIn)
         if (!r.intersect(0, 0, width, height) || r.isEmpty) return
@@ -658,9 +918,12 @@ class TomView(context: Context) : View(context) {
         for (yy in 0 until hpx) {
             for (xx in 0 until wpx) {
                 val c = px[yy * wpx + xx]
-                val luma = (Color.red(c) + Color.green(c) + Color.blue(c)) / 3
-                if (luma < 250 && Script.dissolvesAt(r.left + xx, r.top + yy, stage, dissolveStages)) {
-                    px[yy * wpx + xx] = Color.WHITE
+                // Layer bitmaps are transparent where there is no ink, so
+                // presence is alpha, not luma.
+                if (Color.alpha(c) != 0 &&
+                    Script.dissolvesAt(r.left + xx, r.top + yy, stage, dissolveStages)
+                ) {
+                    px[yy * wpx + xx] = Color.TRANSPARENT
                 }
             }
         }
@@ -671,9 +934,10 @@ class TomView(context: Context) : View(context) {
     private fun finishFade() {
         phase = Phase.IDLE
         resetPlan()
-        page?.drawColor(Color.WHITE)
-        Epd.fullRefresh(this)
+        clearTextLayer()
         rawPen?.setPaused(false)
+        // A new turn begins on the PEN layer, whatever the last one used.
+        activeLayer = Layer.PEN
         status("page clean — mode=${refreshMode.label} pace=${tickMs}ms×${budget()}")
     }
 
@@ -683,14 +947,14 @@ class TomView(context: Context) : View(context) {
         strokes.clear()
         strokeI = 0
         pointI = 0
-        region = null
+        fadeRegion = null
         nextY = -1
-        userInkRegion = null
+        userTextRegion = null
         hasUserInk = false
     }
 
-    private fun growRegion(x: Int, y: Int, margin: Int) {
-        val r = region ?: Rect(x, y, x, y).also { region = it }
+    private fun growFadeRegion(x: Int, y: Int, margin: Int) {
+        val r = fadeRegion ?: Rect(x, y, x, y).also { fadeRegion = it }
         r.union(x - margin, y - margin)
         r.union(x + margin, y + margin)
     }
