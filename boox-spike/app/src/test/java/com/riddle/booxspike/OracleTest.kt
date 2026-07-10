@@ -90,13 +90,18 @@ class OracleTest {
     @Test
     fun turnPromptAsksFullDescriptionOnlyOnTheFirstTurn() {
         // When
-        val first = Oracle.turnPrompt(firstTurn = true)
-        val later = Oracle.turnPrompt(firstTurn = false)
+        val first = Oracle.turnPrompt(firstTurn = true, imgW = 632, imgH = 725, textLineH = 47)
+        val later = Oracle.turnPrompt(firstTurn = false, imgW = 632, imgH = 725, textLineH = 47)
 
         // Then: 兩者都要求 SEE 開頭；首輪要求完整描述、後續只記新增
         assertTrue(first.contains("SEE"))
         assertTrue(later.contains("SEE"))
         assertTrue(first.contains("everything"))
         assertTrue(later.contains("new"))
+
+        // 斷言：兩者都誠實報出快照的像素座標框（模型畫圖的依據）
+        assertTrue(first.contains("632x725"))
+        assertTrue(later.contains("632x725"))
+        assertTrue(first.contains("47"))
     }
 }

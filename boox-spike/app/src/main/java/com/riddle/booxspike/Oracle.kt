@@ -43,6 +43,12 @@ class Oracle(private val cfg: Config) {
     /** One finished turn: what we asked (text only) and the raw DSL reply. */
     data class Exchange(val userText: String, val assistantRaw: String)
 
+    /**
+     * One page capture: the PNG plus the pixel frame the model will draw in
+     * (its own size, and how tall a rendered text line is inside it).
+     */
+    class Snapshot(val png: ByteArray, val width: Int, val height: Int, val textLineH: Int)
+
     private val history = ArrayList<Exchange>()
 
     /** Forget the conversation — Clear starts a fresh session. */
@@ -62,14 +68,19 @@ class Oracle(private val cfg: Config) {
         .readTimeout(90, TimeUnit.SECONDS) // per-read: only silence trips it
         .build()
 
-    fun ask(png: ByteArray, listener: Listener) {
-        val img = Base64.encodeToString(png, Base64.NO_WRAP)
+    fun ask(snap: Snapshot, listener: Listener) {
+        val img = Base64.encodeToString(snap.png, Base64.NO_WRAP)
         thread(name = "oracle") {
             try {
                 val userText: String
                 val hist: List<Exchange>
                 synchronized(history) {
-                    userText = turnPrompt(firstTurn = history.isEmpty())
+                    userText = turnPrompt(
+                        firstTurn = history.isEmpty(),
+                        imgW = snap.width,
+                        imgH = snap.height,
+                        textLineH = snap.textLineH,
+                    )
                     hist = ArrayList(history)
                 }
                 var resp = request(hist, userText, img, "max_tokens")
@@ -172,7 +183,7 @@ class Oracle(private val cfg: Config) {
             - BLACK ink was put down by the user: handwritten words and drawings.
             - BLUE ink is yours from earlier turns. Only drawings persist on the page; written words always fade away once read (theirs and yours), so never re-answer old text.
 
-            Coordinates: the page is a 100x100 grid. x runs 0..100 left to right, y runs 0..100 top to bottom, stretched over the full snapshot. The page is usually not square, so grid cells are not square either — judge proportions by the snapshot itself.
+            Coordinates: every x y in your reply is a pixel position in the snapshot you received this turn — origin at the top-left corner, x growing rightward, y growing downward. Each turn message states the snapshot's exact pixel size; keep every coordinate inside that frame. What you see is the frame you draw in, one to one.
 
             Reply in EXACTLY this plain-text grammar, nothing outside it (no markdown, no code fences):
             SEE
@@ -189,22 +200,32 @@ class Oracle(private val cfg: Config) {
 
             Rules:
             - SEE is your working memory and is NEVER drawn on the page. The page's words fade, but this conversation's history is kept — a SEE block is the only durable record of what was written. START EVERY reply with one: on the first turn of a session, describe everything on the page completely (transcribe every word, describe every drawing); on later turns, briefly note the NEW black ink since your last reply, transcribing any new words exactly.
-            - TEXT is you talking: usually one block of 1-3 short sentences, in the user's language. (x, y) is the block's top-left corner; each line is about 6 grid units tall and wraps at the right page edge. Place it over empty paper, never on top of existing ink.
-            - STROKE is you drawing: one pen stroke per block, drawn in your blue ink, and it stays on the page. Draw whenever it adds something — decorate, answer visually, riff on their sketch. Any number of strokes, including none.
+            - TEXT is you talking: usually one block of 1-3 short sentences, in the user's language. (x, y) is the block's top-left corner in snapshot pixels; the rendered line height is stated in each turn message, and lines wrap at the right page edge. Place it over empty paper, never on top of existing ink.
+            - STROKE is you drawing: one pen stroke per block, drawn in your blue ink, and it stays on the page. Give 3-12 anchor points per stroke — endpoints, corners, curve landmarks — and a smooth hand-drawn curve is drawn through them; do NOT trace every pixel. Draw whenever it adds something — decorate, answer visually, riff on their sketch. Any number of strokes, including none.
             - Everything already on the page is fixed. Never redraw, trace over, or "fix" existing strokes; you only append new ink.
             - At most ${ReplyDsl.MAX_STROKES} STROKE blocks and ${ReplyDsl.MAX_POINTS} P lines per reply.
             - END must be the last line, always.
             """.trimIndent()
 
-        /** The per-turn user message; the page snapshot rides next to it. */
-        fun turnPrompt(firstTurn: Boolean): String = if (firstTurn) {
-            "This is the first turn of a new session. Begin with a SEE block " +
-                "describing everything currently on the page — transcribe every " +
-                "word, describe every drawing and its color. Then reply."
-        } else {
-            "Here is the page as it looks now. Begin with a brief SEE block " +
-                "noting what is new in BLACK ink since your last reply " +
-                "(transcribe new words exactly), then reply."
+        /**
+         * The per-turn user message; the page snapshot rides next to it.
+         * The pixel frame is restated every turn because it is the reply's
+         * coordinate system — and it can change when the page re-lays out.
+         */
+        fun turnPrompt(firstTurn: Boolean, imgW: Int, imgH: Int, textLineH: Int): String {
+            val frame = "The snapshot is ${imgW}x$imgH pixels; every coordinate " +
+                "in your reply is a pixel position in it. A rendered TEXT line " +
+                "is about ${textLineH}px tall."
+            return if (firstTurn) {
+                "This is the first turn of a new session. $frame Begin with a " +
+                    "SEE block describing everything currently on the page — " +
+                    "transcribe every word, describe every drawing and its " +
+                    "color. Then reply."
+            } else {
+                "Here is the page as it looks now. $frame Begin with a brief " +
+                    "SEE block noting what is new in BLACK ink since your last " +
+                    "reply (transcribe new words exactly), then reply."
+            }
         }
 
         /**

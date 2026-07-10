@@ -29,7 +29,8 @@ private const val TAG = "riddle-spike"
  * - PEN layer — the shared canvas. The user's drawings and the oracle's blue
  *   strokes accumulate here across turns; nothing on it ever fades.
  * - TEXT layer — the conversation. The user's written words live here until
- *   the page drinks them at commit; the oracle's spoken reply is written here
+ *   the page is sent (the snapshot carries them to the oracle, so the layer
+ *   clears the moment it is off); the oracle's spoken reply is written here
  *   and dissolves after the linger.
  *
  * The pen starts each turn on the PEN layer; a quick double-tap of the pen
@@ -48,6 +49,9 @@ class TomView(context: Context) : View(context) {
     private val marginXRef = 120f
     private val lineHFactor = 1.25f
     private val nibRRef = 2f
+    // The oracle's DRAWING nib: 2 + 3·0.5 — the user's pressure nib at
+    // typical mid pressure, so its sketches weigh the same as the hand's.
+    private val drawNibRRef = 3.5f
     private val dissolveStages = 10
     private val dissolveTickMs = 80L
 
@@ -106,7 +110,7 @@ class TomView(context: Context) : View(context) {
 
     private val sc: Float get() = width / 1620f
 
-    private enum class Phase { IDLE, DRINKING, THINKING, WRITING, LINGERING, DISSOLVING }
+    private enum class Phase { IDLE, THINKING, WRITING, LINGERING, DISSOLVING }
 
     private var phase = Phase.IDLE
 
@@ -388,15 +392,8 @@ class TomView(context: Context) : View(context) {
         inkDirtyT = min(inkDirtyT, min(lastY, y).toInt() - margin)
         inkDirtyR = max(inkDirtyR, max(lastX, x).toInt() + margin)
         inkDirtyB = max(inkDirtyB, max(lastY, y).toInt() + margin)
-        // inkSegment only ever draws the writer's ink — track it for commit;
-        // only the TEXT layer's share is drunk when the page commits.
+        // inkSegment only ever draws the writer's ink — the commit gates on it.
         hasUserInk = true
-        if (activeLayer == Layer.TEXT) {
-            val u = userTextRegion ?: Rect(x.toInt(), y.toInt(), x.toInt(), y.toInt())
-                .also { userTextRegion = it }
-            u.union(x.toInt() - margin, y.toInt() - margin)
-            u.union(x.toInt() + margin, y.toInt() + margin)
-        }
         lastX = x
         lastY = y
         strokePts++
@@ -466,20 +463,20 @@ class TomView(context: Context) : View(context) {
         }
     }
 
-    // ---- the oracle turn: idle commit → drink → think → streamed reply ----
-    // Mirrors main.rs: IDLE_COMMIT 2.8s after pen-up, dissolve the writer's
-    // TEXT-layer ink while the request flies, buffer reply blocks until the
-    // drink finishes, then ink them with the write animation; the ticker
-    // hovers while the stream is still open (rx.is_some()).
+    // ---- the oracle turn: idle commit → send & clear → streamed reply ----
+    // IDLE_COMMIT 2.8s after pen-up (main.rs). The snapshot carries the
+    // writer's words to the oracle, so the TEXT layer clears the instant the
+    // page is sent; reply blocks ink as they stream, and the ticker hovers
+    // while the stream is still open (rx.is_some()).
 
-    private var userTextRegion: Rect? = null
     private var hasUserInk = false
     private var oracleActive = false
     private var turnWrote = false
-    private val pendingBlocks = ArrayDeque<ReplyDsl.Block>()
-    private var pendingExcuse: String? = null
-    private var drinkStage = 0
-    private var drinkRegion: Rect? = null
+
+    // The pixel frame of the last snapshot — the coordinate system every
+    // reply block is expressed in (see ReplyDsl).
+    private var snapW = 1
+    private var snapH = 1
 
     private val commitCheck = Runnable {
         if (phase == Phase.IDLE && hasUserInk) commitPage()
@@ -496,19 +493,20 @@ class TomView(context: Context) : View(context) {
             status("oracle 未設定 — push oracle.env（見 README）; ink stays")
             return
         }
-        val png = capturePagePng() ?: return
+        val snap = capturePagePng() ?: return
         rawPen?.setPaused(true)
         oracleActive = true
         turnWrote = false
-        pendingBlocks.clear()
-        pendingExcuse = null
-        phase = Phase.DRINKING
-        // Only the words are drunk; the PEN layer is the shared canvas.
-        drinkRegion = userTextRegion?.let { Rect(it) }
-        drinkStage = 0
-        status("the page drinks your words…")
-        ui.post(drinkTicker)
-        o.ask(png, object : Oracle.Listener {
+        phase = Phase.THINKING
+        // The snapshot carries the words — the TEXT layer clears the moment
+        // the page is sent, so the reply lands on clean paper. Partial
+        // refresh, not GC: a flash on every send weighs more than the
+        // leftover ghosting, which the fade's full refresh clears anyway.
+        textBmp?.eraseColor(Color.TRANSPARENT)
+        hasUserInk = false
+        Epd.partial(this, 0, 0, width, height, refreshMode)
+        status("the page is thinking…")
+        o.ask(snap, object : Oracle.Listener {
             override fun onBlock(block: ReplyDsl.Block) {
                 post { onOracleBlock(block) }
             }
@@ -529,7 +527,7 @@ class TomView(context: Context) : View(context) {
      * 100×100 reply grid spans the full page — a crop would shear the
      * mapping between what it sees and where it draws.
      */
-    private fun capturePagePng(): ByteArray? {
+    private fun capturePagePng(): Oracle.Snapshot? {
         val pen = penBmp ?: return null
         val text = textBmp ?: return null
         if (width <= 0 || height <= 0) return null
@@ -548,43 +546,22 @@ class TomView(context: Context) : View(context) {
         snap.compress(Bitmap.CompressFormat.PNG, 100, out)
         snap.recycle()
         val bytes = out.toByteArray()
+        // The reply's coordinate system is this frame — planText/planStroke
+        // scale block coordinates from it back up to the page.
+        snapW = w
+        snapH = h
         // Debug paper trail: exactly what the oracle saw this turn,
         // adb-pullable from files/last-page.png (overwritten every commit).
         runCatching {
             java.io.File(context.getExternalFilesDir(null), "last-page.png").writeBytes(bytes)
         }.onFailure { Log.w(TAG, "last-page.png save failed", it) }
         Log.i(TAG, "sent page ${w}x$h (${bytes.size}B) → files/last-page.png")
-        return bytes
-    }
-
-    private val drinkTicker = object : Runnable {
-        override fun run() {
-            if (phase != Phase.DRINKING) return
-            val reg = drinkRegion ?: run { finishDrink(); return }
-            dissolveRegionPass(textBmp, reg, drinkStage)
-            drinkStage++
-            if (drinkStage >= dissolveStages) finishDrink() else ui.postDelayed(this, dissolveTickMs)
-        }
-    }
-
-    private fun finishDrink() {
-        drinkRegion = null
-        userTextRegion = null
-        hasUserInk = false
-        phase = Phase.THINKING
-        if (pendingBlocks.isEmpty() && pendingExcuse == null) status("the page is thinking…")
-        while (pendingBlocks.isNotEmpty()) {
-            turnWrote = true
-            ink(pendingBlocks.removeFirst())
-        }
-        pendingExcuse?.let {
-            pendingExcuse = null
-            turnWrote = true
-            write(it)
-        }
-        if (!oracleActive && !turnWrote) {
-            writeExcuse("empty reply")
-        }
+        return Oracle.Snapshot(
+            png = bytes,
+            width = w,
+            height = h,
+            textLineH = ((replyPxRef * sc * lineHFactor) / f).roundToInt(),
+        )
     }
 
     private fun onOracleBlock(block: ReplyDsl.Block) {
@@ -593,12 +570,11 @@ class TomView(context: Context) : View(context) {
         // the model's coordinates and our rendering.
         Log.i(TAG, "oracle block: ${describe(block)}")
         if (!oracleActive) return
-        if (phase == Phase.DRINKING) {
-            pendingBlocks.add(block)
-        } else {
-            turnWrote = true
-            ink(block)
-        }
+        // SEE is memory, not ink — it must not count as a visible reply, or
+        // a notes-only turn would leave the page stuck thinking forever.
+        if (block is ReplyDsl.See) return
+        turnWrote = true
+        ink(block)
     }
 
     /** Grid-space digest of one reply block, for the logcat paper trail. */
@@ -624,12 +600,7 @@ class TomView(context: Context) : View(context) {
     private fun onOracleError(reason: String) {
         Log.w(TAG, "oracle error: $reason")
         oracleActive = false
-        if (phase == Phase.DRINKING) {
-            pendingExcuse = excuseFor(reason)
-            turnWrote = true // the excuse counts as the reply
-        } else {
-            writeExcuse(reason)
-        }
+        writeExcuse(reason)
     }
 
     private fun writeExcuse(reason: String) {
@@ -660,9 +631,6 @@ class TomView(context: Context) : View(context) {
 
     /** Plan one streamed reply block and make sure the quill is moving. */
     private fun ink(block: ReplyDsl.Block) {
-        // SEE is the model's memory, bound for the request history — it must
-        // not touch the page (and must not clear a lingering reply).
-        if (block is ReplyDsl.See) return
         prepareForNewInk()
         when (block) {
             is ReplyDsl.Text -> planText(block)
@@ -721,8 +689,6 @@ class TomView(context: Context) : View(context) {
         phase = Phase.IDLE
         // Drop anything still streaming in — it belongs to the dead session.
         oracleActive = false
-        pendingBlocks.clear()
-        pendingExcuse = null
         resetPlan()
         activeLayer = Layer.PEN
         penBmp?.eraseColor(Color.TRANSPARENT)
@@ -755,18 +721,18 @@ class TomView(context: Context) : View(context) {
         nextY = y
     }
 
-    /** A TEXT block: left-aligned at its grid position, wrapping to the margin. */
+    /** A TEXT block: left-aligned at its snapshot position, wrapping to the margin. */
     private fun planText(block: ReplyDsl.Text) {
         val paint = replyPaint()
         val lineH = (replyPxRef * sc * lineHFactor).toInt()
-        // Clamp so the block keeps at least a quarter page to wrap into and
-        // never starts below the last full line.
-        val x0 = (block.x / ReplyDsl.GRID * width)
+        // Snapshot pixels → page pixels, clamped so the block keeps at least
+        // a quarter page to wrap into and never starts below the last line.
+        val x0 = (block.x * width / max(1, snapW))
             .coerceIn(0f, max(0f, width * 0.75f))
             .toInt()
         val maxW = width - x0 - marginXRef * sc
         val lines = wrap(paint, block.text, maxW)
-        var y = (block.y / ReplyDsl.GRID * height).toInt()
+        var y = (block.y * height / max(1, snapH)).toInt()
             .coerceIn(0, max(0, height - lineH * lines.size))
         Log.i(TAG, "text → px x0=$x0 y=$y, ${lines.size} line(s) (page ${width}x$height)")
         for (lineText in lines) {
@@ -789,10 +755,10 @@ class TomView(context: Context) : View(context) {
         }
     }
 
-    /** A STROKE block: grid polyline → page pixels → hand-paced dense path. */
+    /** A STROKE block: snapshot anchors → page pixels → smooth dense curve. */
     private fun planStroke(block: ReplyDsl.Stroke) {
         jitter() // advance the shared LCG so each stroke wobbles differently
-        val mapped = ReplyDsl.mapToCanvas(block.points, width, height)
+        val mapped = ReplyDsl.mapToCanvas(block.points, snapW, snapH, width, height)
         val dense = ReplyDsl.densify(
             mapped,
             spacingPx = max(1, (2 * sc).roundToInt()),
@@ -888,8 +854,6 @@ class TomView(context: Context) : View(context) {
                 dl = min(dl, x - margin); dt = min(dt, y - margin)
                 dr = max(dr, x + margin); db = max(db, y + margin)
             }
-            val r = nibRRef * sc
-            aiPaint.strokeWidth = 2 * r + 1
             while (budget > 0 && strokeI < strokes.size) {
                 val st = strokes[strokeI]
                 val pg = pageFor(st.layer)
@@ -898,6 +862,10 @@ class TomView(context: Context) : View(context) {
                     pointI = 0
                     continue
                 }
+                // Drawing strokes carry the hand's weight; text stays a fine
+                // quill so the script keeps its traced-glyph look.
+                val r = (if (st.layer == Layer.PEN) drawNibRRef else nibRRef) * sc
+                aiPaint.strokeWidth = 2 * r + 1
                 val p = st.pts[pointI]
                 if (pointI > 0) {
                     val q = st.pts[pointI - 1]
@@ -1000,7 +968,6 @@ class TomView(context: Context) : View(context) {
         pointI = 0
         fadeRegion = null
         nextY = -1
-        userTextRegion = null
         hasUserInk = false
     }
 

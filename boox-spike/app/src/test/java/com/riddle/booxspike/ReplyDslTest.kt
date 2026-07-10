@@ -14,7 +14,7 @@ import kotlin.math.hypot
  * SUT:    ReplyDsl.StreamParser / mapToCanvas / densify
  *
  * 目的：驗證 oracle 回覆的 DSL 文法 — 串流下逐 block 解析、對雜訊的容錯、
- *       座標夾限與安全上限，以及 grid → 畫布座標的幾何轉換。
+ *       安全上限，以及快照像素 → 頁面像素的幾何轉換與手繪平滑。
  */
 
 /**
@@ -27,14 +27,15 @@ import kotlin.math.hypot
  *  5. 漏寫 terminator：新 block header 隱式關閉前一個 block
  *  6. 串流中斷：finish() 沖出未終結的 block
  *  7. 壞掉的 P 行被跳過；不足兩點的 stroke 被丟棄
- *  8. 座標夾限在 0..100
+ *  8. parser 不夾限座標 — 原樣保留（夾限在 mapToCanvas，那裡才知道邊界）
  *  9. 上限：最多 MAX_STROKES 筆、MAX_POINTS 個點
  * 10. SEE block（模型的私人筆記，不落墨）照樣逐 block 解析
  * 11. SEE 漏終結符時被下一個 header 隱式關閉
- * 12. mapToCanvas：等比放大並夾在畫布邊界內
- * 13. densify：取樣間距 ≤ spacing、端點保留、無 wobble 時共線
+ * 12. mapToCanvas：依快照→頁面比例縮放並夾在頁面邊界內
+ * 13. densify：取樣間距 ≤ spacing、端點保留、直線輸入不彎曲
  * 14. densify：wobble 有界且同 seed 可重現
  * 15. densify：退化輸入（0 或 1 點）原樣返回
+ * 16. densify：轉角處以平滑曲線通過 — 錨點保留、路徑偏離折線但有界
  */
 class ReplyDslTest {
 
@@ -76,7 +77,7 @@ class ReplyDslTest {
         // 斷言：兩筆 STROKE 各自帶齊 P 點
         val s1 = blocks[1] as ReplyDsl.Stroke
         assertEquals(3, s1.points.size)
-        assertEquals(ReplyDsl.GridPt(60f, 55f), s1.points[1])
+        assertEquals(ReplyDsl.ImgPt(60f, 55f), s1.points[1])
         val s2 = blocks[2] as ReplyDsl.Stroke
         assertEquals(2, s2.points.size)
     }
@@ -168,7 +169,7 @@ class ReplyDslTest {
         // Then: 已累積兩點的 stroke 仍被沖出，不因斷線而遺失
         assertEquals(1, flushed.size)
         assertEquals(
-            listOf(ReplyDsl.GridPt(5f, 5f), ReplyDsl.GridPt(9f, 9f)),
+            listOf(ReplyDsl.ImgPt(5f, 5f), ReplyDsl.ImgPt(9f, 9f)),
             (flushed[0] as ReplyDsl.Stroke).points,
         )
     }
@@ -189,14 +190,14 @@ class ReplyDslTest {
     }
 
     @Test
-    fun coordinatesAreClampedToTheGrid() {
-        // Given: 模型畫出界
+    fun coordinatesPassThroughTheParserUnclamped() {
+        // Given: 模型畫出界 — parser 不知道快照多大，夾限是 mapToCanvas 的事
         val out =
-            "TEXT 150 -2\n" +
+            "TEXT 900 -2\n" +
                 "edge\n" +
                 "END_TEXT\n" +
                 "STROKE\n" +
-                "P -5 130\n" +
+                "P -5 1300\n" +
                 "P 50 50\n" +
                 "END_STROKE\n" +
                 "END\n"
@@ -204,11 +205,11 @@ class ReplyDslTest {
         // When
         val blocks = parseAll(out)
 
-        // Then: 所有座標夾回 0..100
+        // Then: 座標原樣保留，交給知道邊界的下游夾限
         val text = blocks[0] as ReplyDsl.Text
-        assertEquals(100f, text.x, 1e-4f)
-        assertEquals(0f, text.y, 1e-4f)
-        assertEquals(ReplyDsl.GridPt(0f, 100f), (blocks[1] as ReplyDsl.Stroke).points[0])
+        assertEquals(900f, text.x, 1e-4f)
+        assertEquals(-2f, text.y, 1e-4f)
+        assertEquals(ReplyDsl.ImgPt(-5f, 1300f), (blocks[1] as ReplyDsl.Stroke).points[0])
     }
 
     @Test
@@ -279,21 +280,23 @@ class ReplyDslTest {
     }
 
     @Test
-    fun mapToCanvasScalesAndClampsToPageBounds() {
-        // Given: 1000×2000 的畫布（直式，兩軸縮放不同）
+    fun mapToCanvasScalesSnapshotPixelsToPageAndClamps() {
+        // Given: 模型看到 500×725 的快照，頁面實際是 1000×1450（2× 下取樣）
         val pts = listOf(
-            ReplyDsl.GridPt(0f, 0f),
-            ReplyDsl.GridPt(50f, 25f),
-            ReplyDsl.GridPt(100f, 100f),
+            ReplyDsl.ImgPt(0f, 0f),
+            ReplyDsl.ImgPt(250f, 362.5f),
+            ReplyDsl.ImgPt(600f, -10f), // 出界的座標
         )
 
         // When
-        val mapped = ReplyDsl.mapToCanvas(pts, 1000, 2000)
+        val mapped = ReplyDsl.mapToCanvas(pts, 500, 725, 1000, 1450)
 
-        // Then: 依各軸比例放大；grid 100 落在最後一個合法像素（w-1, h-1）
+        // Then: 快照像素依比例放大回頁面像素
         assertEquals(0, mapped[0].x); assertEquals(0, mapped[0].y)
-        assertEquals(500, mapped[1].x); assertEquals(500, mapped[1].y)
-        assertEquals(999, mapped[2].x); assertEquals(1999, mapped[2].y)
+        assertEquals(500, mapped[1].x); assertEquals(725, mapped[1].y)
+
+        // 斷言：出界座標夾在頁面邊界內（最後一個合法像素）
+        assertEquals(999, mapped[2].x); assertEquals(0, mapped[2].y)
     }
 
     @Test
@@ -348,5 +351,45 @@ class ReplyDslTest {
         val single = ReplyDsl.densify(listOf(Script.Pt(3, 4)), 2)
         assertEquals(1, single.size)
         assertEquals(3, single[0].x)
+    }
+
+    @Test
+    fun densifySmoothsCornersIntoCurvesThroughTheAnchors() {
+        // Given: 一個直角 L 形 — 模型只給三個錨點
+        val anchors = listOf(Script.Pt(0, 0), Script.Pt(100, 0), Script.Pt(100, 100))
+
+        // When: 無 wobble 重取樣（只看曲線本身）
+        val dense = ReplyDsl.densify(anchors, spacingPx = 2)
+
+        // 到 L 形折線（兩段線段）的最短距離
+        fun distToPolyline(p: Script.Pt): Double {
+            val dSeg1 = if (p.x in 0..100) abs(p.y).toDouble()
+            else hypot((p.x - 100).toDouble(), p.y.toDouble())
+            val dSeg2 = if (p.y in 0..100) abs(p.x - 100).toDouble()
+            else hypot((p.x - 100).toDouble(), (p.y - 100).toDouble())
+            return minOf(dSeg1, dSeg2)
+        }
+
+        // Then: 三個錨點都被曲線通過（±1px 捨入）— 模型指哪裡就畫到哪裡
+        for (a in anchors) {
+            val hit = dense.any { hypot((it.x - a.x).toDouble(), (it.y - a.y).toDouble()) <= 1.5 }
+            assertTrue("anchor (${a.x},${a.y}) missed", hit)
+        }
+
+        // 斷言：路徑在轉角附近確實彎了 — 有樣本離折線 > 2px（不再是死直的尺規線）
+        val maxDev = dense.maxOf { distToPolyline(it) }
+        assertTrue("curve never left the polyline (maxDev=$maxDev)", maxDev > 2.0)
+
+        // 斷言：彎曲有界 — centripetal 參數化不暴衝（不會畫出離譜的迴圈）
+        assertTrue("curve overshoots (maxDev=$maxDev)", maxDev < 30.0)
+
+        // 斷言：取樣仍然夠密，餵得進逐點動畫
+        for (i in 1 until dense.size) {
+            val d = hypot(
+                (dense[i].x - dense[i - 1].x).toDouble(),
+                (dense[i].y - dense[i - 1].y).toDouble(),
+            )
+            assertTrue("gap $d at $i", d <= 6.0)
+        }
     }
 }
