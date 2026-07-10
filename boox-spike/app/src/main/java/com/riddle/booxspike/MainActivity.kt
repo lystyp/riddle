@@ -68,7 +68,7 @@ class MainActivity : Activity() {
             maxLines = 2
             ellipsize = android.text.TextUtils.TruncateAt.END
             text = if (cfg != null) {
-                "oracle ready (${cfg.model}) — 畫筆層作畫、雙擊筆切文字層寫話，停筆等回應"
+                "oracle ready (${cfg.model}) — 直接寫、直接畫，停筆等回應；字會淡去、畫會留下"
             } else {
                 "oracle 未設定：adb push oracle.env " +
                     "${getExternalFilesDir(null)?.absolutePath}/oracle.env"

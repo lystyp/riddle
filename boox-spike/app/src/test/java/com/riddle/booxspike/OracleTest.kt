@@ -99,10 +99,50 @@ class OracleTest {
         assertTrue(first.contains("everything"))
         assertTrue(later.contains("new"))
 
-        // 斷言：兩者都誠實報出快照的像素座標框（模型畫圖的依據）；
-        // drawing-only 模式下不再提 TEXT 行高
+        // 斷言：兩者都誠實報出快照的像素座標框與 TEXT 行高（模型畫圖與
+        // 排字的依據）
         assertTrue(first.contains("632x725"))
         assertTrue(later.contains("632x725"))
-        assertTrue(!first.contains("TEXT line"))
+        assertTrue(first.contains("47"))
+    }
+}
+
+/**
+ * Unit test — Oracle.parseRegions（區域偵測回覆的解析）
+ *
+ * Scope:  純函式，無網路、無 Android 依賴
+ * Mocks:  無
+ * SUT:    Oracle.parseRegions(raw)
+ *
+ * 目的：驗證 BOX 行的容錯解析 — 正常框、亂序角點的正規化、雜訊行與
+ *       NONE 的忽略。
+ */
+class OracleRegionsTest {
+
+    @Test
+    fun parsesBoxLinesAndNormalizesCorners() {
+        // Given: 兩個框，其中一個角點順序顛倒，夾雜雜訊行
+        val raw = """
+            Sure, here are the boxes:
+            BOX 40 50 200 90
+            BOX 310 120 250 100
+            END
+        """.trimIndent()
+
+        // When
+        val boxes = Oracle.parseRegions(raw)
+
+        // Then: 兩個框都被解析；顛倒的角點被正規化成 左上/右下
+        assertEquals(2, boxes.size)
+        assertEquals(Oracle.TextBox(40, 50, 200, 90), boxes[0])
+        assertEquals(Oracle.TextBox(250, 100, 310, 120), boxes[1])
+    }
+
+    @Test
+    fun noneAndMalformedLinesYieldNothing() {
+        // When / Then: NONE、缺數字、非 BOX 行 → 空清單
+        assertTrue(Oracle.parseRegions("NONE").isEmpty())
+        assertTrue(Oracle.parseRegions("BOX 1 2 3").isEmpty())
+        assertTrue(Oracle.parseRegions("hello\nworld").isEmpty())
     }
 }
