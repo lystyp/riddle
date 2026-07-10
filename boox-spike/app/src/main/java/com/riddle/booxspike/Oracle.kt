@@ -18,9 +18,17 @@ import kotlin.concurrent.thread
  * a data-URI PNG of the page, streamed. Transport is unchanged from the
  * Tom-Riddle era (max_tokens → retry as max_completion_tokens on a 400 that
  * demands it); what changed is the reply: instead of free prose cut into
- * sentences, the model answers in the ReplyDsl grammar, and each TEXT/STROKE
- * block is delivered the moment its terminator streams in, so the quill
- * starts moving before the model finishes.
+ * sentences, the model answers in the ReplyDsl grammar, and each block is
+ * delivered the moment its terminator streams in, so the quill starts moving
+ * before the model finishes.
+ *
+ * An Oracle instance is one conversation. Every finished turn is kept as
+ * text (our prompt, its raw DSL reply) and rides along with the next
+ * request; only the current turn carries the page snapshot, so the payload
+ * does not grow with the session. The words on the page fade after each
+ * turn, which is why every reply must open with a SEE block — the model's
+ * own transcription of what it saw is the only durable record of the user's
+ * side of the conversation.
  */
 class Oracle(private val cfg: Config) {
 
@@ -31,6 +39,16 @@ class Oracle(private val cfg: Config) {
         val maxTokens: Int,
         val reasoning: String?,
     )
+
+    /** One finished turn: what we asked (text only) and the raw DSL reply. */
+    data class Exchange(val userText: String, val assistantRaw: String)
+
+    private val history = ArrayList<Exchange>()
+
+    /** Forget the conversation — Clear starts a fresh session. */
+    fun resetSession() {
+        synchronized(history) { history.clear() }
+    }
 
     /** Callbacks arrive on a background thread; the caller posts to UI. */
     interface Listener {
@@ -48,13 +66,19 @@ class Oracle(private val cfg: Config) {
         val img = Base64.encodeToString(png, Base64.NO_WRAP)
         thread(name = "oracle") {
             try {
-                var resp = request(img, "max_tokens")
+                val userText: String
+                val hist: List<Exchange>
+                synchronized(history) {
+                    userText = turnPrompt(firstTurn = history.isEmpty())
+                    hist = ArrayList(history)
+                }
+                var resp = request(hist, userText, img, "max_tokens")
                 if (resp.code == 400) {
                     val detail = resp.body?.string().orEmpty()
                     resp.close()
                     if (detail.contains("max_completion_tokens")) {
                         Log.i(TAG, "endpoint wants max_completion_tokens; retrying")
-                        resp = request(img, "max_completion_tokens")
+                        resp = request(hist, userText, img, "max_completion_tokens")
                     } else {
                         listener.onError("http 400: ${detail.trim().take(200)}")
                         return@thread
@@ -68,8 +92,10 @@ class Oracle(private val cfg: Config) {
                 }
 
                 // SSE: `data: {json}` lines; delta.content fragments feed the
-                // DSL parser and completed blocks go out as they form.
+                // DSL parser and completed blocks go out as they form. The
+                // verbatim reply is kept too — it becomes the history entry.
                 val parser = ReplyDsl.StreamParser()
+                val rawReply = StringBuilder()
                 var emitted = false
                 fun deliver(blocks: List<ReplyDsl.Block>) {
                     for (b in blocks) {
@@ -84,11 +110,20 @@ class Oracle(private val cfg: Config) {
                         if (data == "[DONE]") break
                         val frag = sseDeltaContent(data) ?: continue
                         if (frag.isEmpty()) continue
+                        rawReply.append(frag)
                         deliver(parser.feed(frag))
                     }
                 }
                 deliver(parser.finish())
-                if (!emitted) listener.onError("empty reply") else listener.onDone()
+                if (!emitted) {
+                    listener.onError("empty reply")
+                } else {
+                    synchronized(history) {
+                        history.add(Exchange(userText, rawReply.toString().trim()))
+                        while (history.size > MAX_TURNS) history.removeAt(0)
+                    }
+                    listener.onDone()
+                }
             } catch (e: Exception) {
                 Log.w(TAG, "oracle request failed", e)
                 listener.onError("request failed: ${e.message ?: e.javaClass.simpleName}")
@@ -96,27 +131,18 @@ class Oracle(private val cfg: Config) {
         }
     }
 
-    private fun request(img: String, capField: String): okhttp3.Response {
+    private fun request(
+        hist: List<Exchange>,
+        userText: String,
+        img: String,
+        capField: String,
+    ): okhttp3.Response {
         val body = JSONObject().apply {
             put("model", cfg.model)
             put("stream", true)
             put(capField, cfg.maxTokens)
             cfg.reasoning?.let { put("reasoning_effort", it) }
-            put("messages", JSONArray().apply {
-                put(JSONObject().put("role", "system").put("content", SYSTEM_PROMPT))
-                put(JSONObject().put("role", "user").put("content", JSONArray().apply {
-                    put(
-                        JSONObject().put("type", "text")
-                            .put("text", "Here is the page as it looks now. Reply in the grammar.")
-                    )
-                    put(
-                        JSONObject().put("type", "image_url").put(
-                            "image_url",
-                            JSONObject().put("url", "data:image/png;base64,$img")
-                        )
-                    )
-                }))
-            })
+            put("messages", messagesJson(hist, userText, img))
         }.toString()
         return client.newCall(
             Request.Builder()
@@ -129,6 +155,9 @@ class Oracle(private val cfg: Config) {
 
     companion object {
         private const val TAG = "riddle-spike"
+
+        /** Turns of history that ride along with each request. */
+        const val MAX_TURNS = 8
 
         /**
          * No persona, just temperament: a lively companion on a shared page.
@@ -146,6 +175,9 @@ class Oracle(private val cfg: Config) {
             Coordinates: the page is a 100x100 grid. x runs 0..100 left to right, y runs 0..100 top to bottom, stretched over the full snapshot. The page is usually not square, so grid cells are not square either — judge proportions by the snapshot itself.
 
             Reply in EXACTLY this plain-text grammar, nothing outside it (no markdown, no code fences):
+            SEE
+            your private notes about the page, one or more lines
+            END_SEE
             TEXT x y
             what you say, one or more lines
             END_TEXT
@@ -156,12 +188,48 @@ class Oracle(private val cfg: Config) {
             END
 
             Rules:
+            - SEE is your working memory and is NEVER drawn on the page. The page's words fade, but this conversation's history is kept — a SEE block is the only durable record of what was written. START EVERY reply with one: on the first turn of a session, describe everything on the page completely (transcribe every word, describe every drawing); on later turns, briefly note the NEW black ink since your last reply, transcribing any new words exactly.
             - TEXT is you talking: usually one block of 1-3 short sentences, in the user's language. (x, y) is the block's top-left corner; each line is about 6 grid units tall and wraps at the right page edge. Place it over empty paper, never on top of existing ink.
             - STROKE is you drawing: one pen stroke per block, drawn in your blue ink, and it stays on the page. Draw whenever it adds something — decorate, answer visually, riff on their sketch. Any number of strokes, including none.
             - Everything already on the page is fixed. Never redraw, trace over, or "fix" existing strokes; you only append new ink.
             - At most ${ReplyDsl.MAX_STROKES} STROKE blocks and ${ReplyDsl.MAX_POINTS} P lines per reply.
             - END must be the last line, always.
             """.trimIndent()
+
+        /** The per-turn user message; the page snapshot rides next to it. */
+        fun turnPrompt(firstTurn: Boolean): String = if (firstTurn) {
+            "This is the first turn of a new session. Begin with a SEE block " +
+                "describing everything currently on the page — transcribe every " +
+                "word, describe every drawing and its color. Then reply."
+        } else {
+            "Here is the page as it looks now. Begin with a brief SEE block " +
+                "noting what is new in BLACK ink since your last reply " +
+                "(transcribe new words exactly), then reply."
+        }
+
+        /**
+         * Assemble the messages array: system, then the kept turns as plain
+         * text (our prompt / its raw DSL reply), then the current turn with
+         * the snapshot. Only the current turn carries an image — the past
+         * pages' content survives via the SEE notes inside the raw replies.
+         */
+        fun messagesJson(hist: List<Exchange>, userText: String, imgB64: String): JSONArray =
+            JSONArray().apply {
+                put(JSONObject().put("role", "system").put("content", SYSTEM_PROMPT))
+                for (e in hist.takeLast(MAX_TURNS)) {
+                    put(JSONObject().put("role", "user").put("content", e.userText))
+                    put(JSONObject().put("role", "assistant").put("content", e.assistantRaw))
+                }
+                put(JSONObject().put("role", "user").put("content", JSONArray().apply {
+                    put(JSONObject().put("type", "text").put("text", userText))
+                    put(
+                        JSONObject().put("type", "image_url").put(
+                            "image_url",
+                            JSONObject().put("url", "data:image/png;base64,$imgB64")
+                        )
+                    )
+                }))
+            }
 
         /**
          * Load oracle.env from the app's external files dir (adb-pushable

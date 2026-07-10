@@ -14,6 +14,9 @@ import kotlin.math.sqrt
  * stay short no matter how large the panel is. A reply is a sequence of
  * blocks:
  *
+ *   SEE               the model's private notes — its memory of the page,
+ *   ...lines...       never drawn; page words fade, so this is how past
+ *   END_SEE           turns stay recoverable from the conversation history
  *   TEXT x y          what it says, placed at the block's top-left
  *   ...lines...
  *   END_TEXT
@@ -47,6 +50,9 @@ object ReplyDsl {
     /** One drawn stroke through `points`, in the oracle's own ink. */
     data class Stroke(val points: List<GridPt>) : Block
 
+    /** The model's private notes about the page — memory, never drawn. */
+    data class See(val text: String) : Block
+
     /**
      * Incremental line parser over the streamed reply. Feed it raw content
      * fragments as they arrive; it returns blocks as they complete. Unknown
@@ -63,6 +69,7 @@ object ReplyDsl {
         private var textPos: GridPt? = null
         private val textLines = ArrayList<String>()
         private var strokePts: ArrayList<GridPt>? = null
+        private var seeLines: ArrayList<String>? = null
 
         private var strokesEmitted = 0
         private var pointBudget = MAX_POINTS
@@ -91,6 +98,7 @@ object ReplyDsl {
             }
             endText(out)
             endStroke(out)
+            endSee(out)
             done = true
             return out
         }
@@ -111,16 +119,24 @@ object ReplyDsl {
                     else -> { addPoint(t); return }
                 }
             }
+            seeLines?.let { lines ->
+                when {
+                    t == "END_SEE" -> { endSee(out); return }
+                    isBlockHeader(t) -> endSee(out) // missing terminator
+                    else -> { lines.add(raw.trimEnd()); return }
+                }
+            }
             when {
                 t == "END" -> done = true
                 t == "STROKE" -> strokePts = ArrayList()
+                t == "SEE" -> seeLines = ArrayList()
                 t.startsWith("TEXT") -> beginText(t)
                 // Anything else at top level is model chatter — tolerated.
             }
         }
 
         private fun isBlockHeader(t: String): Boolean =
-            t == "END" || t == "STROKE" || t.startsWith("TEXT ")
+            t == "END" || t == "STROKE" || t == "SEE" || t.startsWith("TEXT ")
 
         private fun beginText(t: String) {
             val tok = t.split(WS)
@@ -148,6 +164,13 @@ object ReplyDsl {
             if (pointBudget <= 0) return
             pointBudget--
             pts.add(GridPt(clamp(x), clamp(y)))
+        }
+
+        private fun endSee(out: ArrayList<Block>) {
+            val lines = seeLines ?: return
+            seeLines = null
+            val text = lines.joinToString("\n").trim()
+            if (text.isNotEmpty()) out.add(See(text))
         }
 
         private fun endStroke(out: ArrayList<Block>) {

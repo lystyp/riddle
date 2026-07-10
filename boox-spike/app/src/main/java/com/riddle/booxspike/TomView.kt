@@ -133,17 +133,21 @@ class TomView(context: Context) : View(context) {
         ui.removeCallbacksAndMessages(null)
         phase = Phase.IDLE
         resetPlan()
-        activeLayer = Layer.PEN
-        penBmp?.recycle()
-        penBmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888).also {
-            it.eraseColor(Color.TRANSPARENT)
-            penPage = Canvas(it)
+        // The layers survive a re-layout (Hide/chrome toggles resize the
+        // view): ink is anchored top-left into the new bitmaps. Only Clear
+        // may empty the pen layer.
+        penBmp = remapLayer(penBmp, w, h).also { penPage = Canvas(it) }
+        textBmp = remapLayer(textBmp, w, h).also { textPage = Canvas(it) }
+    }
+
+    private fun remapLayer(old: Bitmap?, w: Int, h: Int): Bitmap {
+        val next = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+        next.eraseColor(Color.TRANSPARENT)
+        old?.let {
+            Canvas(next).drawBitmap(it, 0f, 0f, null)
+            it.recycle()
         }
-        textBmp?.recycle()
-        textBmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888).also {
-            it.eraseColor(Color.TRANSPARENT)
-            textPage = Canvas(it)
-        }
+        return next
     }
 
     override fun onDraw(canvas: Canvas) {
@@ -627,10 +631,14 @@ class TomView(context: Context) : View(context) {
 
     /** Plan one streamed reply block and make sure the quill is moving. */
     private fun ink(block: ReplyDsl.Block) {
+        // SEE is the model's memory, bound for the request history — it must
+        // not touch the page (and must not clear a lingering reply).
+        if (block is ReplyDsl.See) return
         prepareForNewInk()
         when (block) {
             is ReplyDsl.Text -> planText(block)
             is ReplyDsl.Stroke -> planStroke(block)
+            is ReplyDsl.See -> {}
         }
         startWriting()
     }
@@ -678,16 +686,22 @@ class TomView(context: Context) : View(context) {
         Epd.fullRefresh(this)
     }
 
+    /** Clear ends the whole session: both layers AND the oracle's memory. */
     fun clearPage() {
         ui.removeCallbacksAndMessages(null)
         phase = Phase.IDLE
+        // Drop anything still streaming in — it belongs to the dead session.
+        oracleActive = false
+        pendingBlocks.clear()
+        pendingExcuse = null
         resetPlan()
         activeLayer = Layer.PEN
         penBmp?.eraseColor(Color.TRANSPARENT)
         textBmp?.eraseColor(Color.TRANSPARENT)
+        oracle?.resetSession()
         Epd.fullRefresh(this)
         rawPen?.setPaused(false)
-        status("cleared — mode=${refreshMode.label} pace=${tickMs}ms×${budget()}")
+        status("cleared — 新 session，mode=${refreshMode.label} pace=${tickMs}ms×${budget()}")
     }
 
     // ---- plan_reply, same layout math ----

@@ -29,10 +29,12 @@ import kotlin.math.hypot
  *  7. 壞掉的 P 行被跳過；不足兩點的 stroke 被丟棄
  *  8. 座標夾限在 0..100
  *  9. 上限：最多 MAX_STROKES 筆、MAX_POINTS 個點
- * 10. mapToCanvas：等比放大並夾在畫布邊界內
- * 11. densify：取樣間距 ≤ spacing、端點保留、無 wobble 時共線
- * 12. densify：wobble 有界且同 seed 可重現
- * 13. densify：退化輸入（0 或 1 點）原樣返回
+ * 10. SEE block（模型的私人筆記，不落墨）照樣逐 block 解析
+ * 11. SEE 漏終結符時被下一個 header 隱式關閉
+ * 12. mapToCanvas：等比放大並夾在畫布邊界內
+ * 13. densify：取樣間距 ≤ spacing、端點保留、無 wobble 時共線
+ * 14. densify：wobble 有界且同 seed 可重現
+ * 15. densify：退化輸入（0 或 1 點）原樣返回
  */
 class ReplyDslTest {
 
@@ -229,6 +231,51 @@ class ReplyDslTest {
 
         // 斷言：總點數不超過 MAX_POINTS（超過預算的點被丟棄）
         assertTrue(strokes.sumOf { it.points.size } <= ReplyDsl.MAX_POINTS)
+    }
+
+    @Test
+    fun parserEmitsSeeBlocksAlongsideVisibleOnes() {
+        // Given: 回覆以 SEE（記憶用，不落墨）開頭，接著才是可見的 TEXT
+        val reply =
+            "SEE\n" +
+                "A black cat sketch, top-left.\n" +
+                "New words: hello there.\n" +
+                "END_SEE\n" +
+                "TEXT 5 5\n" +
+                "hi\n" +
+                "END_TEXT\n" +
+                "END\n"
+
+        // When
+        val blocks = parseAll(reply)
+
+        // Then: SEE 與 TEXT 依序各成一個 block，SEE 的多行內容保留
+        assertEquals(2, blocks.size)
+        assertEquals(
+            "A black cat sketch, top-left.\nNew words: hello there.",
+            (blocks[0] as ReplyDsl.See).text,
+        )
+        assertEquals("hi", (blocks[1] as ReplyDsl.Text).text)
+    }
+
+    @Test
+    fun seeWithoutTerminatorIsClosedByTheNextHeader() {
+        // Given: 模型忘了 END_SEE，直接開 TEXT
+        val sloppy =
+            "SEE\n" +
+                "notes about the page\n" +
+                "TEXT 1 2\n" +
+                "yo\n" +
+                "END_TEXT\n" +
+                "END\n"
+
+        // When
+        val blocks = parseAll(sloppy)
+
+        // Then: SEE 被 TEXT header 隱式關閉，兩個 block 都活下來
+        assertEquals(2, blocks.size)
+        assertEquals("notes about the page", (blocks[0] as ReplyDsl.See).text)
+        assertEquals("yo", (blocks[1] as ReplyDsl.Text).text)
     }
 
     @Test
