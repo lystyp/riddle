@@ -26,8 +26,11 @@ npm run dev        # http://localhost:5173
 ```
 
 按 **Oracle…** 貼上 oracle.env 的內容（同 riddle / boox 的變數名，存在
-localStorage）。瀏覽器直連 API，base 端點要允許 CORS——api.openai.com 可以；
-自架端點接不通就得開個 proxy。
+localStorage）。懶得貼的話，把設定放進 `public/oracle.env`（gitignored）——
+頁面啟動時若 localStorage 還沒有可用設定，會自動從它種入；手動存過的設定
+優先。注意：dev server 開 `--host` 時，同網段的人抓得到這個檔（裡面有 key）。
+瀏覽器直連 API，base 端點要允許 CORS——api.openai.com 可以；自架端點接不通
+就得開個 proxy。
 
 沒有 key 也能跑整條迴圈：
 

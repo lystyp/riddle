@@ -17,6 +17,26 @@ let textI = 0;
 // Same oracle.env text the tablet flavours use, kept in localStorage.
 const ENV_STORAGE_KEY = "riddle-web.oracle.env";
 
+/**
+ * Mirror the tablet's file-based config: web/public/oracle.env (gitignored,
+ * served at /oracle.env in dev) seeds localStorage so a fresh browser needs
+ * no manual paste. A hand-saved localStorage config wins — the file only
+ * fills the gap while the stored text is missing or unusable (no key).
+ */
+async function seedEnvFromFile(): Promise<void> {
+  if (parseOracleEnv(localStorage.getItem(ENV_STORAGE_KEY) ?? "") !== null) return;
+  try {
+    const resp = await fetch("/oracle.env");
+    if (!resp.ok) return;
+    const text = await resp.text();
+    if (parseOracleEnv(text) === null) return; // placeholder or HTML 404 page
+    localStorage.setItem(ENV_STORAGE_KEY, text);
+    console.info("oracle config seeded from /oracle.env");
+  } catch {
+    // no file, no seed — the Oracle… dialog still works
+  }
+}
+
 const canvas = document.querySelector<HTMLCanvasElement>("#page")!;
 const status = document.querySelector<HTMLSpanElement>("#status")!;
 const dialog = document.querySelector<HTMLDialogElement>("#oracle-dialog")!;
@@ -57,10 +77,14 @@ dialog.addEventListener("close", () => {
 
 // Rasterization needs the real TTFs, not the fallback the canvas would
 // silently substitute — block the oracle wiring (not the pen) on them.
+const boot = async () => {
+  await seedEnvFromFile();
+  applyOracleConfig();
+};
 Promise.all([
   document.fonts.load("96px Caveat", "Tom"),
   document.fonts.load('96px "LXGW WenKai TC"', "謎"),
-]).then(applyOracleConfig, () => {
+]).then(boot, () => {
   status.textContent = "字型載入失敗 — 回寫會用系統字型";
-  applyOracleConfig();
+  void boot();
 });
