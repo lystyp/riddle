@@ -31,7 +31,7 @@ function applyOracleConfig() {
   const cfg = parseOracleEnv(localStorage.getItem(ENV_STORAGE_KEY) ?? "");
   tom.oracle = cfg ? new Oracle(cfg) : null;
   status.textContent = cfg
-    ? `oracle ready (${cfg.model}) — write to Tom, rest the pen, and wait`
+    ? `oracle ready (${cfg.model}) — 直接寫、直接畫，停筆等回應；字會淡去、畫會留下`
     : "oracle 未設定 — 按 Oracle… 貼上 oracle.env 內容";
 }
 

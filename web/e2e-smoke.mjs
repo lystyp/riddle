@@ -1,6 +1,6 @@
 // End-to-end smoke: drive the real page in headless Chrome against the
 // mock oracle — draw a stroke, wait out the 2.8s idle commit, and watch
-// the status line walk drink → think → write → linger → dissolve → clean.
+// the status line walk think → write → linger → fade → clean.
 // Proves the whole loop without a tablet, an APK install, or an API key.
 //
 //   node e2e-smoke.mjs            # needs Google Chrome installed
@@ -78,10 +78,10 @@ try {
   await page.mouse.up();
   await waitStatus(page, "stroke:", 3000);
 
-  console.log("stage: idle commit → the diary drinks");
-  await waitStatus(page, "drinks your ink", 6000);
+  console.log("stage: idle commit → the page thinks");
+  await waitStatus(page, "thinking", 6000);
 
-  console.log("stage: Tom writes back");
+  console.log("stage: the oracle writes back");
   await waitStatus(page, "wrote ", 120000);
 
   const inkPixels = await page.evaluate(() => {
