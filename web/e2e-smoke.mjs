@@ -53,15 +53,18 @@ try {
 
   browser = await chromium.launch({ channel: "chrome", headless: true });
   const page = await browser.newPage({ viewport: { width: 1200, height: 800 } });
-  await page.addInitScript(
-    ([env]) => localStorage.setItem("riddle-web.oracle.env", env),
-    [
-      [
+  // The page treats /oracle.env as the source of truth, so override the
+  // config through that same channel — return the mock's OpenAI config
+  // instead of the developer's real public/oracle.env.
+  await page.route("**/oracle.env", (route) =>
+    route.fulfill({
+      contentType: "text/plain",
+      body: [
         "RIDDLE_OPENAI_KEY=mock",
         `RIDDLE_OPENAI_BASE=http://localhost:${MOCK_PORT}/v1`,
         "RIDDLE_OPENAI_MODEL=mock-model",
       ].join("\n"),
-    ],
+    }),
   );
   await page.goto(`http://localhost:${VITE_PORT}/`);
 

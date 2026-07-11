@@ -1,26 +1,35 @@
-// The spirit that shares the page — OpenAI-compatible /chat/completions
-// with a data-URI PNG of the page, streamed. Ported from boox-spike's
-// Oracle.kt: same prompts, same request shape (max_tokens → retry as
-// max_completion_tokens on a 400 that demands it), same block streaming —
-// delta fragments feed the ReplyDsl parser and each block goes out the
-// moment its terminator arrives, so the quill starts moving before the
-// model finishes. OkHttp becomes fetch + ReadableStream; the page arrives
-// as a canvas data URL, already in the data-URI form the request wants.
+// The spirit that shares the page — the conversation layer above any
+// LLM vendor. Owns the persona and region-detector prompts, the reply
+// DSL streaming (fragments feed the ReplyDsl parser and each block goes
+// out the moment its terminator arrives, so the quill starts moving
+// while the model is still talking), and the session memory.
 //
 // An Oracle instance is one conversation. Every finished turn is kept as
 // text (our prompt, its raw DSL reply) and rides along with the next
-// request; only the current turn carries the page snapshot, so the payload
-// does not grow with the session. The words on the page fade after each
-// turn, which is why every reply must open with a SEE block — the model's
-// own transcription of what it saw is the only durable record of the
-// user's side of the conversation.
+// request; only the current turn carries the page snapshot, so the
+// payload does not grow with the session. The words on the page fade
+// after each turn, which is why every reply must open with a SEE block —
+// the model's own transcription of what it saw is the only durable
+// record of the user's side of the conversation.
 //
-// Browser caveat: the endpoint must allow CORS (api.openai.com does; a
-// self-hosted base may need a dev proxy).
+// Wire formats, endpoints, and stream decoding live behind LlmProvider
+// (llm/) — this file never sees them. Ported from boox-spike's
+// Oracle.kt; the web flavour keeps the same oracle.env config text,
+// extended with RIDDLE_PROVIDER to pick the vendor.
+//
+// Browser caveat: the endpoint must allow CORS (api.openai.com and
+// api.anthropic.com both do; a self-hosted base may need a dev proxy).
 
+import type {
+  ChatRequest,
+  ChatTurn,
+  LlmProvider,
+  ProviderKind,
+} from "./llm/provider";
 import { StreamParser, type Block } from "./reply-dsl";
 
 export interface OracleConfig {
+  provider: ProviderKind;
   key: string;
   base: string;
   model: string;
@@ -29,10 +38,7 @@ export interface OracleConfig {
 }
 
 /** One finished turn: what we asked (text only) and the raw DSL reply. */
-export interface Exchange {
-  userText: string;
-  assistantRaw: string;
-}
+export type Exchange = ChatTurn;
 
 /**
  * One page capture: the PNG data URL plus the pixel frame the model will
@@ -58,9 +64,6 @@ export interface OracleListener {
   onDone(): void;
   onError(reason: string): void;
 }
-
-/** OkHttp's readTimeout equivalent: only silence between chunks trips it. */
-const READ_IDLE_MS = 90_000;
 
 /** Turns of history that ride along with each request. */
 export const MAX_TURNS = 8;
@@ -174,55 +177,6 @@ export function turnPrompt(
         `new words exactly), then reply.`;
 }
 
-type Message = { role: string; content: unknown };
-
-/**
- * Assemble the messages array: system, then the kept turns as plain text
- * (our prompt / its raw DSL reply), then the current turn with the
- * snapshot. Only the current turn carries an image — the past pages'
- * content survives via the SEE notes inside the raw replies.
- */
-export function messagesJson(
-  hist: Exchange[],
-  userText: string,
-  imgUrl: string,
-): Message[] {
-  const msgs: Message[] = [{ role: "system", content: SYSTEM_PROMPT }];
-  for (const e of hist.slice(-MAX_TURNS)) {
-    msgs.push({ role: "user", content: e.userText });
-    msgs.push({ role: "assistant", content: e.assistantRaw });
-  }
-  msgs.push({
-    role: "user",
-    content: [
-      { type: "text", text: userText },
-      { type: "image_url", image_url: { url: imgUrl } },
-    ],
-  });
-  return msgs;
-}
-
-/** Messages for one region-detection call: system + snapshot turn. */
-export function regionMessagesJson(
-  imgW: number,
-  imgH: number,
-  imgUrl: string,
-): Message[] {
-  return [
-    { role: "system", content: REGION_PROMPT },
-    {
-      role: "user",
-      content: [
-        {
-          type: "text",
-          text: `The snapshot is ${imgW}x${imgH} pixels. Box the conversational messages, if any.`,
-        },
-        { type: "image_url", image_url: { url: imgUrl } },
-      ],
-    },
-  ];
-}
-
 /**
  * Parse BOX lines out of a region reply. Tolerant: chatter and malformed
  * lines are dropped, corners are normalized, empty or NONE replies yield
@@ -252,7 +206,10 @@ export function parseRegions(raw: string): TextBox[] {
 export class Oracle {
   private readonly history: Exchange[] = [];
 
-  constructor(private readonly cfg: OracleConfig) {}
+  constructor(
+    private readonly provider: LlmProvider,
+    private readonly cfg: Pick<OracleConfig, "maxTokens" | "reasoning">,
+  ) {}
 
   /** Forget the conversation — Clear starts a fresh session. */
   resetSession(): void {
@@ -271,27 +228,18 @@ export class Oracle {
         snap.height,
         snap.textLineH,
       );
-      const msgs = messagesJson(this.history, userText, snap.pngDataUrl);
-      let resp = await this.request(msgs, "max_tokens", true);
-      if (resp.status === 400) {
-        const detail = await resp.text();
-        if (detail.includes("max_completion_tokens")) {
-          console.info("oracle: endpoint wants max_completion_tokens; retrying");
-          resp = await this.request(msgs, "max_completion_tokens", true);
-        } else {
-          listener.onError(`http 400: ${detail.trim().slice(0, 200)}`);
-          return;
-        }
-      }
-      if (!resp.ok) {
-        const detail = await resp.text();
-        listener.onError(`http ${resp.status}: ${detail.trim().slice(0, 200)}`);
-        return;
-      }
+      const req: ChatRequest = {
+        system: SYSTEM_PROMPT,
+        turns: this.history.slice(-MAX_TURNS),
+        userText,
+        imageDataUrl: snap.pngDataUrl,
+        maxTokens: this.cfg.maxTokens,
+        effort: this.cfg.reasoning,
+      };
 
-      // SSE: `data: {json}` lines; delta.content fragments feed the DSL
-      // parser and completed blocks go out as they form. The verbatim
-      // reply is kept too — it becomes the history entry.
+      // Fragments feed the DSL parser and completed blocks go out as
+      // they form. The verbatim reply is kept too — it becomes the
+      // history entry.
       const parser = new StreamParser();
       let rawReply = "";
       let emitted = false;
@@ -301,27 +249,10 @@ export class Oracle {
           listener.onBlock(b);
         }
       };
-      const reader = resp.body!.getReader();
-      const decoder = new TextDecoder();
-      let buf = "";
-      stream: for (;;) {
-        const { done, value } = await readWithIdleTimeout(reader);
-        if (done) break;
-        buf += decoder.decode(value, { stream: true });
-        let nl: number;
-        while ((nl = buf.indexOf("\n")) >= 0) {
-          const raw = buf.slice(0, nl).trim();
-          buf = buf.slice(nl + 1);
-          if (!raw.startsWith("data:")) continue;
-          const data = raw.slice("data:".length).trim();
-          if (data.length === 0) continue;
-          if (data === "[DONE]") break stream;
-          const frag = sseDeltaContent(data);
-          if (!frag) continue;
-          rawReply += frag;
-          deliver(parser.feed(frag));
-        }
-      }
+      await this.provider.stream(req, (frag) => {
+        rawReply += frag;
+        deliver(parser.feed(frag));
+      });
       deliver(parser.finish());
       if (!emitted) {
         listener.onError("empty reply");
@@ -344,24 +275,15 @@ export class Oracle {
    */
   async askTextRegions(snap: Snapshot): Promise<TextBox[]> {
     try {
-      const msgs = regionMessagesJson(snap.width, snap.height, snap.pngDataUrl);
-      let resp = await this.request(msgs, "max_tokens", false);
-      if (resp.status === 400) {
-        const detail = await resp.text();
-        if (detail.includes("max_completion_tokens")) {
-          resp = await this.request(msgs, "max_completion_tokens", false);
-        } else {
-          console.warn(`region call 400: ${detail.trim().slice(0, 200)}`);
-          return [];
-        }
-      }
-      if (!resp.ok) {
-        console.warn(`region call http ${resp.status}`);
-        return [];
-      }
-      const body: unknown = await resp.json();
-      const content: unknown = (body as any)?.choices?.[0]?.message?.content;
-      const boxes = parseRegions(typeof content === "string" ? content : "");
+      const req: ChatRequest = {
+        system: REGION_PROMPT,
+        turns: [],
+        userText: `The snapshot is ${snap.width}x${snap.height} pixels. Box the conversational messages, if any.`,
+        imageDataUrl: snap.pngDataUrl,
+        maxTokens: this.cfg.maxTokens,
+        effort: this.cfg.reasoning,
+      };
+      const boxes = parseRegions(await this.provider.complete(req));
       console.info(`text regions: ${boxes.length} box(es)`);
       return boxes;
     } catch (e) {
@@ -369,55 +291,33 @@ export class Oracle {
       return [];
     }
   }
-
-  private request(
-    messages: Message[],
-    capField: string,
-    stream: boolean,
-  ): Promise<Response> {
-    const body: Record<string, unknown> = {
-      model: this.cfg.model,
-      stream,
-      [capField]: this.cfg.maxTokens,
-      messages,
-    };
-    if (this.cfg.reasoning !== null) body.reasoning_effort = this.cfg.reasoning;
-    return fetch(`${this.cfg.base}/chat/completions`, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${this.cfg.key}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify(body),
-    });
-  }
 }
 
-function readWithIdleTimeout(
-  reader: ReadableStreamDefaultReader<Uint8Array>,
-): Promise<ReadableStreamReadResult<Uint8Array>> {
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => {
-      reader.cancel().catch(() => {});
-      reject(new Error(`stream idle for ${READ_IDLE_MS / 1000}s`));
-    }, READ_IDLE_MS);
-    reader.read().then(
-      (r) => {
-        clearTimeout(timer);
-        resolve(r);
-      },
-      (e) => {
-        clearTimeout(timer);
-        reject(e);
-      },
-    );
-  });
+/**
+ * Per-vendor defaults for the config fields oracle.env may omit. The
+ * anthropic token cap is roomier because Fable 5's always-on thinking
+ * bills into max_tokens — a 2000 cap would be eaten before the reply.
+ */
+const PROVIDER_DEFAULTS: Record<
+  ProviderKind,
+  { base: string; model: string; maxTokens: number }
+> = {
+  openai: { base: "https://api.openai.com/v1", model: "gpt-4o-mini", maxTokens: 2000 },
+  anthropic: { base: "https://api.anthropic.com/v1", model: "claude-fable-5", maxTokens: 8000 },
+};
+
+function isProviderKind(v: string): v is ProviderKind {
+  return v === "openai" || v === "anthropic";
 }
 
 /**
  * Parse oracle.env-style text: same variable names as riddle's oracle.env;
  * `export K=V` and `K=V` lines both accepted. The tablet flavours read this
  * from a file; the web harness keeps the same text in localStorage.
+ *
+ * RIDDLE_PROVIDER (default "openai") picks the vendor; each vendor reads
+ * its own RIDDLE_<PROVIDER>_{KEY,BASE,MODEL,MAX_TOKENS,REASONING} group,
+ * so one file can hold both and switch with a single line.
  */
 export function parseOracleEnv(text: string): OracleConfig | null {
   const vars = new Map<string, string>();
@@ -429,24 +329,19 @@ export function parseOracleEnv(text: string): OracleConfig | null {
     const k = t.slice(0, i).trim().replace(/^export/, "").trim();
     vars.set(k, t.slice(i + 1).trim().replace(/^["']+|["']+$/g, ""));
   }
-  const key = vars.get("RIDDLE_OPENAI_KEY");
+  const kind = (vars.get("RIDDLE_PROVIDER") ?? "openai").toLowerCase();
+  if (!isProviderKind(kind)) return null;
+  const defaults = PROVIDER_DEFAULTS[kind];
+  const v = (name: string) => vars.get(`RIDDLE_${kind.toUpperCase()}_${name}`);
+  const key = v("KEY");
   if (!key) return null;
-  const maxTokens = Number.parseInt(vars.get("RIDDLE_OPENAI_MAX_TOKENS") ?? "", 10);
+  const maxTokens = Number.parseInt(v("MAX_TOKENS") ?? "", 10);
   return {
+    provider: kind,
     key,
-    base: (vars.get("RIDDLE_OPENAI_BASE") ?? "https://api.openai.com/v1").replace(/\/+$/, ""),
-    model: vars.get("RIDDLE_OPENAI_MODEL") ?? "gpt-4o-mini",
-    maxTokens: Number.isNaN(maxTokens) ? 2000 : maxTokens,
-    reasoning: vars.get("RIDDLE_OPENAI_REASONING") || null,
+    base: (v("BASE") ?? defaults.base).replace(/\/+$/, ""),
+    model: v("MODEL") ?? defaults.model,
+    maxTokens: Number.isNaN(maxTokens) ? defaults.maxTokens : maxTokens,
+    reasoning: v("REASONING") || null,
   };
-}
-
-/** choices[0].delta.content out of one SSE data object. */
-export function sseDeltaContent(data: string): string | null {
-  try {
-    const content: unknown = JSON.parse(data)?.choices?.[0]?.delta?.content;
-    return typeof content === "string" ? content : "";
-  } catch {
-    return null;
-  }
 }
